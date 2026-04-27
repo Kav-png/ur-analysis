@@ -4,6 +4,8 @@ import io
 from datetime import datetime
 from pathlib import Path
 
+import altair as alt
+
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
@@ -520,7 +522,73 @@ if st.session_state.groups:
         )
         st.caption("Amber rows = application appeared in 3 or more months")
 
-        # Bar chart: top 10 applications by total incidents
+        # ── Monthly volume chart with moving average + target line ──
+        st.markdown("**Monthly Incident Volume**")
+
+        target_pct = st.slider(
+            "Target reduction per month (%)", min_value=1, max_value=30, value=10, step=1,
+            help="Red dashed line shows the target if incidents reduce by this % each month from the first saved month"
+        )
+
+        # Build monthly totals in chronological order
+        month_idx = {m: i for i, m in enumerate(months)}
+        sorted_history = sorted(history, key=lambda r: (int(r["year"]), month_idx.get(r["month"], 0)))
+        monthly_rows = []
+        for record in sorted_history:
+            label = f"{record['month'][:3]} {record['year']}"
+            total = sum(g.get("count", 0) for g in record.get("groups", []))
+            monthly_rows.append({"month": label, "total": total})
+
+        df_vol = pd.DataFrame(monthly_rows)
+        df_vol["order"] = range(len(df_vol))
+
+        # 3-month rolling moving average
+        df_vol["moving_avg"] = df_vol["total"].rolling(window=3, min_periods=1).mean().round(1)
+
+        # Target reduction line starting from first month
+        baseline = df_vol["total"].iloc[0]
+        df_vol["target"] = [round(baseline * ((1 - target_pct / 100) ** i), 1) for i in range(len(df_vol))]
+
+        # Bar colour: amber if above moving average, steel blue if at or below
+        df_vol["status"] = df_vol.apply(
+            lambda r: "Above average" if r["total"] > r["moving_avg"] else "At or below average", axis=1
+        )
+
+        base = alt.Chart(df_vol).encode(
+            x=alt.X("month:N", sort=None, title="Month", axis=alt.Axis(labelAngle=-30))
+        )
+
+        bars = base.mark_bar(opacity=0.85).encode(
+            y=alt.Y("total:Q", title="Total Incidents"),
+            color=alt.Color("status:N", scale=alt.Scale(
+                domain=["Above average", "At or below average"],
+                range=["#E07B39", "#1F3864"]
+            ), legend=alt.Legend(title="vs Moving Average")),
+            tooltip=[
+                alt.Tooltip("month:N", title="Month"),
+                alt.Tooltip("total:Q", title="Total Incidents"),
+                alt.Tooltip("moving_avg:Q", title="3-Month Avg"),
+                alt.Tooltip("target:Q", title=f"Target (-{target_pct}%/mo)"),
+            ]
+        )
+
+        ma_line = base.mark_line(color="#F4A900", strokeWidth=2.5, point=True).encode(
+            y=alt.Y("moving_avg:Q"),
+            tooltip=[alt.Tooltip("moving_avg:Q", title="3-Month Moving Avg")]
+        )
+
+        target_line = base.mark_line(color="#C00000", strokeWidth=2, strokeDash=[6, 3]).encode(
+            y=alt.Y("target:Q"),
+            tooltip=[alt.Tooltip("target:Q", title=f"Target (-{target_pct}%/mo)")]
+        )
+
+        chart = (bars + ma_line + target_line).properties(height=350).configure_axis(
+            labelFontSize=12, titleFontSize=13
+        )
+        st.altair_chart(chart, use_container_width=True)
+        st.caption("Orange line = 3-month moving average  |  Red dashed = target reduction trajectory")
+
+        # Top 10 applications by total incidents
         top10 = app_month_counts.head(10)["Total"].sort_values(ascending=True)
         st.markdown("**Top 10 Applications — Total Incidents Across All Months**")
         st.bar_chart(top10)
