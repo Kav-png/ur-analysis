@@ -129,8 +129,18 @@ Rules:
 </groups>"""
 
 
+def normalise_quotes(text: str) -> str:
+    return (text
+        .replace('“', '"').replace('”', '"')   # curly double quotes
+        .replace('‘', "'").replace('’', "'")   # curly single quotes
+        .replace('′', "'").replace('″', '"')   # prime characters
+        .replace('﻿', '')                            # BOM
+    )
+
+
 def parse_enrichment_response(raw: str, raw_groups: dict[str, list[str]]) -> list[dict] | None:
     cleaned = re.sub(r"```json|```", "", raw).strip()
+    cleaned = normalise_quotes(cleaned)
     # Extract the outermost JSON object even if the AI added surrounding text
     json_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
     if json_match:
@@ -381,8 +391,14 @@ if st.session_state.enrichment_prompt:
             st.warning("Paste the AI enrichment response before processing.")
         else:
             groups = parse_enrichment_response(enrichment_response, st.session_state.raw_groups)
+            print(enrichment_response)
+            print(groups)
             if groups is None:
                 st.error("Could not parse the response as JSON. Make sure you copied the full response.")
+                with st.expander("Debug — show what was received"):
+                    st.text(f"Length: {len(enrichment_response)} chars")
+                    st.text(f"First 300 chars:\n{enrichment_response[:300]}")
+                    st.text(f"Last 100 chars:\n{enrichment_response[-100:]}")
             elif len(groups) == 0:
                 st.warning("No groups were parsed. Try re-running the enrichment prompt.")
             else:
