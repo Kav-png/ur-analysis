@@ -101,14 +101,26 @@ def parse_response(raw: str) -> list[dict] | None:
         raw_groups = data.get("g") or data.get("groups", [])
     except json.JSONDecodeError:
         return None
+
     groups = []
+    seen: set[str] = set()   # deduplicate URs across groups — first group wins
+
     for g in raw_groups:
-        ids = g.get("ids") or g.get("incident_numbers", [])
+        ids_raw = g.get("ids") or g.get("incident_numbers", [])
+        # Deduplicate within the group itself, then against already-claimed URs
+        unique_ids = []
+        for n in ids_raw:
+            key = str(n).strip()
+            if key and key not in seen:
+                seen.add(key)
+                unique_ids.append(key)
+        if not unique_ids:
+            continue  # skip groups that end up empty after deduplication
         groups.append({
             "application":        g.get("app")  or g.get("application", "Unknown System"),
             "issue":              g.get("iss")  or g.get("issue", ""),
-            "incident_numbers":   ids,
-            "count":              len(ids),
+            "incident_numbers":   unique_ids,
+            "count":              len(unique_ids),
             "business_impact":    g.get("imp")  or g.get("business_impact", ""),
             "recommended_action": g.get("act")  or g.get("recommended_action", ""),
         })
@@ -326,7 +338,16 @@ if st.session_state.prompt:
                 if extra_groups is None:
                     st.error("Could not parse the follow-up response as JSON.")
                 else:
-                    st.session_state.groups = st.session_state.groups + extra_groups
+                    # Merge and re-deduplicate across the combined group list
+                    combined = st.session_state.groups + extra_groups
+                    seen: set[str] = set()
+                    merged = []
+                    for g in combined:
+                        unique_ids = [n for n in g["incident_numbers"] if n not in seen]
+                        seen.update(unique_ids)
+                        if unique_ids:
+                            merged.append({**g, "incident_numbers": unique_ids, "count": len(unique_ids)})
+                    st.session_state.groups = merged
                     # Recompute missing
                     all_ids = set(st.session_state.df["number"].astype(str))
                     covered_ids = {str(n) for g in st.session_state.groups for n in g.get("incident_numbers", [])}
