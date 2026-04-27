@@ -2,6 +2,7 @@ import re
 import json
 import io
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -16,192 +17,217 @@ st.set_page_config(page_title="Incident Pattern Analyser", layout="wide")
 st.title("Incident Pattern Analyser")
 st.caption("Surface recurring issues for senior management reporting")
 
+# ── constants ──────────────────────────────────────────────────────────────────
+DATA_DIR = Path("data")
+now = datetime.now()
+months = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+]
+years = [str(y) for y in range(now.year, now.year - 5, -1)]
+
 # ── session state ──────────────────────────────────────────────────────────────
-for key in ("df", "prompt", "groups", "missing_ids", "followup_prompt"):
+for key in ("df", "grouping_prompt", "raw_groups", "enrichment_prompt", "groups", "missing_ids"):
     if key not in st.session_state:
         st.session_state[key] = None
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
-# Get current month and year
-now = datetime.now()
-current_month = now.strftime("%B")  # e.g., "April"
-current_year = now.year
-
-# List of months and years (e.g., last 5 years)
-months = [
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December"
-]
-years = [str(y) for y in range(current_year, current_year - 5, -1)]
-
-
 def preprocess(text: str, maxlen: int = 200) -> str:
     text = str(text)
-    # Remove ticket IDs (e.g., INC00123, UR123456)
     text = re.sub(r'\b[A-Z]{2,4}\d{5,}\b', '', text)
-    # Remove emails
     text = re.sub(r'\S+@\S+', '', text)
-    # Remove long numbers (likely IDs, phone numbers)
     text = re.sub(r'\b\d{5,}\b', '', text)
-    # Remove bracketed tags and content
     text = re.sub(r'\[.*?\]', '', text)
-    # Remove boilerplate/disclaimer lines
     text = re.sub(r'Client Identifying Data.*?not allowed.*?\.?', '', text, flags=re.IGNORECASE)
     text = re.sub(r'No CID Disclaimer accepted: TRUE', '', text, flags=re.IGNORECASE)
     text = re.sub(r'I have read and understood the disclaimer.*', '', text, flags=re.IGNORECASE)
-    # Remove greetings and sign-offs (start/end of lines)
     text = re.sub(r'^(hi|hello|dear|greetings)[\s,]+', '', text, flags=re.IGNORECASE)
     text = re.sub(r'(thanks|thank you|regards|best regards|cheers)[\s,]*$', '', text, flags=re.IGNORECASE)
-    # Remove phone numbers and user details
     text = re.sub(r'Tel\.?[\s:\-]*\d+', '', text, flags=re.IGNORECASE)
     text = re.sub(r'User details:.*?(?=Topic:|$)', '', text, flags=re.IGNORECASE)
-    # Remove (T12345) style tags
     text = re.sub(r'\(T\d+\)', '', text)
-    # Remove long digit/space/hyphen combos (phone numbers)
     text = re.sub(r'\+?\d[\d\s\-]{7,}', '', text)
-    # Remove repeated dashes/underscores
     text = re.sub(r'[-_]{2,}', '', text)
-    # Collapse whitespace
     text = re.sub(r'\s+', ' ', text).strip()
-    # Truncate to maxlen
-    return text
+    return text[:maxlen]
 
-def build_prompt(rows: list[dict], is_followup: bool = False) -> str:
-    incidents = "\n".join(
-        f"{i+1}. [{r['number']}] {r['description']}" for i, r in enumerate(rows)
-    )
-    context = "These are the REMAINING incidents not yet grouped. " if is_followup else ""
-    return f"""You are analyzing {len(rows)} IT incidents from an Investment Bank.
-{context}Your output will be used by senior management to reduce recurring incidents.
+
+def build_grouping_prompt(rows: list[dict]) -> str:
+    n = len(rows)
+    incidents = "\n".join(f"{i+1}. [{r['number']}] {r['description']}" for i, r in enumerate(rows))
+    return f"""⚠ CRITICAL: Every incident number must appear in exactly one group.
+
+<instructions>
+Group these {n} Investment Bank IT incidents by shared root cause or repeated operational workflow.
+
+Do NOT put the same incident number in more than one group.
+Do NOT omit any incident number — every single one must appear in the output.
+Do NOT add incident numbers that were not in the list below.
+Groups of 1 are allowed for incidents with a unique issue.
+
+Output format — plain text only, no JSON, no descriptions:
+Group 1: UR001, UR004, UR012
+Group 2: UR002
+Group 3: UR003, UR007, UR099
+</instructions>
+
+⚠ CRITICAL: Before returning, count every incident number in your output.
+You received {n} incidents. If your total count ≠ {n}, find the missing ones and fix it before returning.
+
+<incidents>
+{incidents}
+</incidents>"""
+
+
+def parse_grouping_response(raw: str) -> dict[str, list[str]] | None:
+    groups: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for line in raw.strip().splitlines():
+        m = re.match(r'[Gg]roup\s*\d+\s*[:\-]\s*(.+)', line.strip())
+        if m:
+            ids = []
+            for x in m.group(1).split(','):
+                key = x.strip()
+                if key and key not in seen:
+                    seen.add(key)
+                    ids.append(key)
+            if ids:
+                groups[f"Group {len(groups)+1}"] = ids
+    return groups if groups else None
+
+
+def build_enrichment_prompt(raw_groups: dict[str, list[str]], df: pd.DataFrame) -> str:
+    id_to_desc = dict(zip(df["number"].astype(str), df["description"]))
+    summaries = []
+    for label, ids in raw_groups.items():
+        descs = [id_to_desc.get(i, "") for i in ids if id_to_desc.get(i)]
+        rep = max(descs, key=len)[:250] if descs else "No description available"
+        summaries.append(f"{label} ({len(ids)} incident{'s' if len(ids) != 1 else ''}): {rep}")
+    groups_text = "\n".join(summaries)
+    g = len(raw_groups)
+    return f"""You are enriching {g} pre-formed incident groups for senior management reporting at an Investment Bank.
+
+For each group, identify the application and describe the issue precisely.
+
+Example — use exactly this JSON structure for each group:
+{{"app":"Bloomberg","iss":"Users locked out after overnight AD sync failure","imp":"Traders unable to access live pricing at market open","act":"Schedule AD sync outside trading hours"}}
+
+Now enrich all {g} groups below. Return a single JSON object wrapping all results:
+{{"g":[{{"app":"...","iss":"...","imp":"...","act":"..."}}]}}
 
 Rules:
-- Extract the application or system name from the description text.
-- Group incidents together if they share the same root cause OR if they represent repeated requests for the same operational process or workflow (e.g. repeated requests to create Storm IDs, repeated manual report retriggers).
-- Be specific: write "Users locked out after AD password reset" not "access issue".
-- Every incident must appear in the output — include unique incidents as their own group of 1.
-- If the application cannot be identified from the text, use "Unknown System".
-- Return ONLY valid JSON — no markdown fences, no explanation, nothing else.
+- "app": name of the system or application extracted from the description
+- "iss": precise issue description — be specific, not generic
+- "imp": one sentence on business effect
+- "act": one concrete recommended action
+- If application cannot be identified, use "Unknown System"
+- Return ONLY valid JSON — no markdown fences, no explanation
 
-Use this compact output format to keep the response small:
-{{"g":[{{"app":"application name","iss":"precise issue description","ids":["UR001","UR002"],"imp":"one-sentence business impact","act":"one concrete recommended action"}}]}}
-
-Before returning: count the total incident numbers across all "ids" arrays.
-You were given {len(rows)} incidents. If your total is less than {len(rows)}, find the missing ones and add them as individual groups before returning.
-
-Incidents:
-{incidents}
-"""
+<groups>
+{groups_text}
+</groups>"""
 
 
-def parse_response(raw: str) -> list[dict] | None:
+def parse_enrichment_response(raw: str, raw_groups: dict[str, list[str]]) -> list[dict] | None:
     cleaned = re.sub(r"```json|```", "", raw).strip()
     try:
         data = json.loads(cleaned)
-        raw_groups = data.get("g") or data.get("groups", [])
+        enriched = data.get("g") or data.get("groups", [])
     except json.JSONDecodeError:
         return None
 
-    groups = []
-    seen: set[str] = set()   # deduplicate URs across groups — first group wins
-
-    for g in raw_groups:
-        ids_raw = g.get("ids") or g.get("incident_numbers", [])
-        # Deduplicate within the group itself, then against already-claimed URs
-        unique_ids = []
-        for n in ids_raw:
-            key = str(n).strip()
-            if key and key not in seen:
-                seen.add(key)
-                unique_ids.append(key)
-        if not unique_ids:
-            continue  # skip groups that end up empty after deduplication
-        groups.append({
-            "application":        g.get("app")  or g.get("application", "Unknown System"),
-            "issue":              g.get("iss")  or g.get("issue", ""),
-            "incident_numbers":   unique_ids,
-            "count":              len(unique_ids),
-            "business_impact":    g.get("imp")  or g.get("business_impact", ""),
-            "recommended_action": g.get("act")  or g.get("recommended_action", ""),
+    group_labels = list(raw_groups.keys())
+    result = []
+    for idx, e in enumerate(enriched):
+        label = group_labels[idx] if idx < len(group_labels) else f"Group {idx+1}"
+        ids = raw_groups.get(label, [])
+        result.append({
+            "application":        e.get("app") or e.get("application", "Unknown System"),
+            "issue":              e.get("iss") or e.get("issue", ""),
+            "incident_numbers":   ids,
+            "count":              len(ids),
+            "business_impact":    e.get("imp") or e.get("business_impact", ""),
+            "recommended_action": e.get("act") or e.get("recommended_action", ""),
         })
-    return groups
+    return result
+
+
+def save_monthly_data(df: pd.DataFrame, groups: list[dict], year: str, month: str) -> tuple[str, str]:
+    DATA_DIR.mkdir(exist_ok=True)
+    raw_path  = DATA_DIR / f"raw_data_{year}_{month}.csv"
+    proc_path = DATA_DIR / f"processed_data_{year}_{month}.json"
+    df[["number", "description_raw"]].to_csv(raw_path, index=False)
+    proc_path.write_text(json.dumps({"year": year, "month": month, "groups": groups}, indent=2))
+    return str(raw_path), str(proc_path)
+
+
+def load_history() -> list[dict]:
+    if not DATA_DIR.exists():
+        return []
+    records = []
+    for f in sorted(DATA_DIR.glob("processed_data_*.json")):
+        try:
+            records.append(json.loads(f.read_text()))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return records
 
 
 def build_excel(groups: list[dict], unaccounted_df: pd.DataFrame | None = None) -> bytes:
     wb = Workbook()
+    header_font  = Font(bold=True, color="FFFFFF")
+    header_fill  = PatternFill("solid", fgColor="1F3864")
+    alt_fill     = PatternFill("solid", fgColor="DCE6F1")
 
     # ── Sheet 1: Management Summary ──
     ws1 = wb.active
     ws1.title = "Management Summary"
-
     headers = ["Application", "Issue", "Count", "Business Impact", "Recommended Action"]
     ws1.append(headers)
-
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="1F3864")
-    alt_fill = PatternFill("solid", fgColor="DCE6F1")
-
     for col_idx, _ in enumerate(headers, 1):
         cell = ws1.cell(row=1, column=col_idx)
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", wrap_text=True)
-
     ws1.freeze_panes = "A2"
-
     sorted_groups = sorted(groups, key=lambda g: g.get("count", 0), reverse=True)
     for row_idx, g in enumerate(sorted_groups, 2):
-        ws1.append([
-            g.get("application", ""),
-            g.get("issue", ""),
-            g.get("count", 0),
-            g.get("business_impact", ""),
-            g.get("recommended_action", ""),
-        ])
+        ws1.append([g.get("application",""), g.get("issue",""), g.get("count",0),
+                    g.get("business_impact",""), g.get("recommended_action","")])
         if row_idx % 2 == 0:
-            for col_idx in range(1, len(headers) + 1):
+            for col_idx in range(1, len(headers)+1):
                 ws1.cell(row=row_idx, column=col_idx).fill = alt_fill
-        for col_idx in range(1, len(headers) + 1):
+        for col_idx in range(1, len(headers)+1):
             ws1.cell(row=row_idx, column=col_idx).alignment = Alignment(wrap_text=True)
-
-    col_widths = [28, 48, 10, 48, 48]
-    for i, width in enumerate(col_widths, 1):
+    for i, width in enumerate([28, 48, 10, 48, 48], 1):
         ws1.column_dimensions[get_column_letter(i)].width = width
 
     # ── Sheet 2: Incident Detail ──
     ws2 = wb.create_sheet("Incident Detail")
     detail_headers = ["Group", "Application", "Issue", "Incident Numbers"]
     ws2.append(detail_headers)
-
     for col_idx, _ in enumerate(detail_headers, 1):
         cell = ws2.cell(row=1, column=col_idx)
-        cell.font = Font(bold=True, color="FFFFFF")
+        cell.font = header_font
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
-
     ws2.freeze_panes = "A2"
-
     for group_idx, g in enumerate(sorted_groups, 1):
-        inc_numbers = ", ".join(g.get("incident_numbers", []))
-        ws2.append([
-            group_idx,
-            g.get("application", ""),
-            g.get("issue", ""),
-            inc_numbers,
-        ])
-        ws2.cell(row=group_idx + 1, column=4).alignment = Alignment(wrap_text=True)
-
+        ws2.append([group_idx, g.get("application",""), g.get("issue",""),
+                    ", ".join(g.get("incident_numbers",[]))])
+        ws2.cell(row=group_idx+1, column=4).alignment = Alignment(wrap_text=True)
     for col_idx, width in enumerate([8, 28, 48, 60], 1):
         ws2.column_dimensions[get_column_letter(col_idx)].width = width
 
-    # ── Sheet 3: Unaccounted Incidents (only if gaps remain) ──
+    # ── Sheet 3: Unaccounted (only if gaps remain) ──
     if unaccounted_df is not None and not unaccounted_df.empty:
         ws3 = wb.create_sheet("Unaccounted")
         ua_headers = ["Incident Number", "Description"]
         ws3.append(ua_headers)
         for col_idx, _ in enumerate(ua_headers, 1):
             cell = ws3.cell(row=1, column=col_idx)
-            cell.font = Font(bold=True, color="FFFFFF")
+            cell.font = header_font
             cell.fill = PatternFill("solid", fgColor="C00000")
             cell.alignment = Alignment(horizontal="center")
         ws3.freeze_panes = "A2"
@@ -228,139 +254,140 @@ if uploaded:
     col1, col2 = st.columns(2)
     num_col = col1.selectbox(
         "Incident number column", cols,
-        index=next((i for i, c in enumerate(cols) if "number" in c.lower() or "id" in c.lower() or "inc" in c.lower()), 0)
+        index=next((i for i, c in enumerate(cols)
+                    if "number" in c.lower() or "id" in c.lower() or "inc" in c.lower()), 0)
     )
     desc_col = col2.selectbox(
-        "Description column",
-        cols,
-        index=(
-            next((i for i, c in enumerate(cols) if c.lower() == "description"),
-                next((i for i, c in enumerate(cols) if "description" in c.lower() or "summary" in c.lower()),
-                    min(1, len(cols)-1)))
-        )
+        "Description column", cols,
+        index=(next((i for i, c in enumerate(cols) if c.lower() == "description"),
+               next((i for i, c in enumerate(cols)
+                     if "description" in c.lower() or "summary" in c.lower()), min(1, len(cols)-1))))
     )
 
     df = df_raw[[num_col, desc_col]].dropna(subset=[desc_col]).copy()
     df.columns = ["number", "description_raw"]
     df["description"] = df["description_raw"].apply(preprocess)
-
     st.session_state.df = df
 
     st.success(f"{len(df)} incidents loaded")
     st.dataframe(df[["number", "description_raw"]].head(5), use_container_width=True, hide_index=True)
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Generate Prompt
+# STEP 2 — Pass 1: Grouping
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.df is not None:
     st.divider()
-    st.header("Step 2 — Generate AI Prompt")
+    st.header("Step 2 — Group Incidents (Pass 1 of 2)")
+    st.caption("This prompt asks the AI to assign every incident to a group. Output is plain text — always fits within AI response limits.")
 
-    if st.button("Generate Prompt", type="primary"):
+    if st.button("Generate Grouping Prompt", type="primary"):
         rows = st.session_state.df[["number", "description"]].to_dict("records")
-        st.session_state.prompt = build_prompt(rows)
+        st.session_state.grouping_prompt = build_grouping_prompt(rows)
+        # Reset downstream state when regenerating
+        st.session_state.raw_groups = None
+        st.session_state.enrichment_prompt = None
+        st.session_state.groups = None
 
-    if st.session_state.prompt:
-        st.info("Copy the entire prompt below and paste it into Claude, ChatGPT, or your AI tool of choice.")
-        preview_lines = "\n".join(st.session_state.prompt.splitlines()[:10])
-        st.code(preview_lines + "\n...", language=None)
-        with st.expander("Show full prompt"):
-            st.code(st.session_state.prompt, language=None)
-        copy_button(st.session_state.prompt, tooltip="Copy full prompt to clipboard", copied_label="Copied!", icon="st")
+    if st.session_state.grouping_prompt:
+        st.info("Copy the prompt below and paste it into Claude, ChatGPT, or your AI tool. The AI will return a plain list of groups.")
+        preview = "\n".join(st.session_state.grouping_prompt.splitlines()[:12])
+        st.code(preview + "\n...", language=None)
+        with st.expander("Show full grouping prompt"):
+            st.code(st.session_state.grouping_prompt, language=None)
+        copy_button(st.session_state.grouping_prompt, tooltip="Copy grouping prompt", copied_label="Copied!", icon="st")
         st.markdown(
-            """
-            <a href="https://goto/red" target="_blank">
+            """<a href="https://goto/red" target="_blank">
                 <button style="background-color:red;color:white;padding:0.5em 1.5em;border:none;border-radius:4px;font-size:1em;cursor:pointer;">
                     Go to Red Portal
                 </button>
-            </a>
-            """,
+            </a>""",
             unsafe_allow_html=True
         )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Paste AI Response
-# ══════════════════════════════════════════════════════════════════════════════
-if st.session_state.prompt:
-    st.divider()
-    st.header("Step 3 — Paste AI Response")
+        st.subheader("Paste Grouping Response")
+        grouping_response = st.text_area(
+            "Paste the AI response here (plain text groups)",
+            height=200,
+            placeholder="Group 1: UR001, UR004, UR012\nGroup 2: UR002\nGroup 3: UR003, UR007",
+            key="grouping_textarea"
+        )
 
-    raw_response = st.text_area(
-        "Paste the AI response here",
+        if st.button("Process Grouping", type="primary", key="process_grouping"):
+            if not grouping_response.strip():
+                st.warning("Paste the AI grouping response before processing.")
+            else:
+                raw_groups = parse_grouping_response(grouping_response)
+                if not raw_groups:
+                    st.error("Could not parse groups from the response. Make sure the AI returned lines like 'Group 1: UR001, UR002'.")
+                else:
+                    st.session_state.raw_groups = raw_groups
+
+                    # Coverage check
+                    all_ids = set(st.session_state.df["number"].astype(str))
+                    covered_ids = {n for ids in raw_groups.values() for n in ids}
+                    missing = sorted(all_ids - covered_ids)
+                    st.session_state.missing_ids = missing
+
+                    total_groups = len(raw_groups)
+                    total_covered = len(covered_ids)
+
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Groups Found", total_groups)
+                    c2.metric("Incidents Assigned", total_covered)
+                    c3.metric("Missing", len(missing))
+
+                    if not missing:
+                        st.success(f"All {len(all_ids)} incidents assigned to groups.")
+                    else:
+                        st.warning(f"⚠ {len(missing)} incidents not found in the grouping response. They will be listed in the Unaccounted sheet.")
+                        missing_df = st.session_state.df[st.session_state.df["number"].astype(str).isin(missing)]
+                        with st.expander(f"Show {len(missing)} unassigned incidents"):
+                            st.dataframe(missing_df[["number", "description_raw"]], use_container_width=True, hide_index=True)
+
+                    # Auto-generate enrichment prompt
+                    st.session_state.enrichment_prompt = build_enrichment_prompt(raw_groups, st.session_state.df)
+                    st.success(f"Grouping complete. Enrichment prompt ready in Step 3.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — Pass 2: Enrichment
+# ══════════════════════════════════════════════════════════════════════════════
+if st.session_state.enrichment_prompt:
+    st.divider()
+    st.header("Step 3 — Enrich Groups (Pass 2 of 2)")
+    st.caption("This prompt sends only the group summaries — not all 300 incidents — so the AI response is small and complete.")
+
+    st.info("Copy the prompt below and paste it into your AI tool. The AI will return JSON with application names, issue descriptions, business impact, and recommended actions.")
+    preview = "\n".join(st.session_state.enrichment_prompt.splitlines()[:12])
+    st.code(preview + "\n...", language=None)
+    with st.expander("Show full enrichment prompt"):
+        st.code(st.session_state.enrichment_prompt, language=None)
+    copy_button(st.session_state.enrichment_prompt, tooltip="Copy enrichment prompt", copied_label="Copied!", icon="st")
+
+    enrichment_response = st.text_area(
+        "Paste the AI enrichment response here (JSON)",
         height=250,
-        placeholder='{"groups": [{"application": "...", "issue": "...", ...}]}'
+        placeholder='{"g":[{"app":"Bloomberg","iss":"...","imp":"...","act":"..."}]}',
+        key="enrichment_textarea"
     )
 
-    if st.button("Process Response", type="primary"):
-        if not raw_response.strip():
-            st.warning("Paste the AI response before processing.")
+    if st.button("Process Enrichment", type="primary", key="process_enrichment"):
+        if not enrichment_response.strip():
+            st.warning("Paste the AI enrichment response before processing.")
         else:
-            groups = parse_response(raw_response)
+            groups = parse_enrichment_response(enrichment_response, st.session_state.raw_groups)
             if groups is None:
-                st.error("Could not parse the response as JSON. Make sure you copied the full response and try again.")
+                st.error("Could not parse the response as JSON. Make sure you copied the full response.")
             elif len(groups) == 0:
-                st.warning("No groups were found. The AI may not have identified recurring patterns — try re-running the prompt.")
+                st.warning("No groups were parsed. Try re-running the enrichment prompt.")
             else:
                 st.session_state.groups = groups
-                st.success(f"Parsed {len(groups)} incident groups successfully.")
-                # Coverage check
-                all_ids = set(st.session_state.df["number"].astype(str))
-                covered_ids = {str(n) for g in groups for n in g.get("incident_numbers", [])}
-                missing = sorted(all_ids - covered_ids)
-                st.session_state.missing_ids = missing
-                if not missing:
-                    st.success(f"All {len(all_ids)} incidents accounted for.")
-                else:
-                    st.warning(f"⚠ {len(missing)} of {len(all_ids)} incidents were not returned by the AI.")
-                    missing_df = st.session_state.df[st.session_state.df["number"].astype(str).isin(missing)]
-                    with st.expander(f"Show {len(missing)} unaccounted incidents"):
-                        st.dataframe(missing_df[["number", "description_raw"]], use_container_width=True, hide_index=True)
-                    followup_rows = missing_df[["number", "description"]].to_dict("records")
-                    st.session_state.followup_prompt = build_prompt(followup_rows, is_followup=True)
+                st.success(f"Enrichment complete — {len(groups)} groups ready.")
 
-    # Follow-up prompt for missing incidents
-    if st.session_state.missing_ids and st.session_state.followup_prompt:
-        st.divider()
-        st.subheader("Follow-up Prompt (optional)")
-        st.info("Paste this into your AI tool to group the remaining incidents, then paste the response below.")
-        preview = "\n".join(st.session_state.followup_prompt.splitlines()[:8])
-        st.code(preview + "\n...", language=None)
-        with st.expander("Show full follow-up prompt"):
-            st.code(st.session_state.followup_prompt, language=None)
-        copy_button(st.session_state.followup_prompt, tooltip="Copy follow-up prompt", copied_label="Copied!", icon="st")
-
-        followup_response = st.text_area("Paste follow-up AI response here", height=180, key="followup_textarea")
-        if st.button("Merge Follow-up Response", type="secondary"):
-            if not followup_response.strip():
-                st.warning("Paste the follow-up response before merging.")
-            else:
-                extra_groups = parse_response(followup_response)
-                if extra_groups is None:
-                    st.error("Could not parse the follow-up response as JSON.")
-                else:
-                    # Merge and re-deduplicate across the combined group list
-                    combined = st.session_state.groups + extra_groups
-                    seen: set[str] = set()
-                    merged = []
-                    for g in combined:
-                        unique_ids = [n for n in g["incident_numbers"] if n not in seen]
-                        seen.update(unique_ids)
-                        if unique_ids:
-                            merged.append({**g, "incident_numbers": unique_ids, "count": len(unique_ids)})
-                    st.session_state.groups = merged
-                    # Recompute missing
-                    all_ids = set(st.session_state.df["number"].astype(str))
-                    covered_ids = {str(n) for g in st.session_state.groups for n in g.get("incident_numbers", [])}
-                    still_missing = sorted(all_ids - covered_ids)
-                    st.session_state.missing_ids = still_missing
-                    if not still_missing:
-                        st.success(f"All {len(all_ids)} incidents now accounted for.")
-                    else:
-                        st.warning(f"⚠ {len(still_missing)} incidents still unaccounted for — they will appear in the Excel 'Unaccounted' sheet.")
-                    st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — Results & Export
+# STEP 4 — Results, Save & History
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.groups:
     st.divider()
@@ -368,11 +395,11 @@ if st.session_state.groups:
 
     col_month, col_year = st.columns([2, 1])
     selected_month = col_month.selectbox("Report Month", months, index=now.month - 1)
-    selected_year = col_year.selectbox("Report Year", years, index=0)
+    selected_year  = col_year.selectbox("Report Year", years, index=0)
 
     groups = st.session_state.groups
     total_covered = sum(g.get("count", 0) for g in groups)
-    applications = sorted({g.get("application", "Unknown") for g in groups})
+    applications  = sorted({g.get("application", "Unknown") for g in groups})
 
     m0, m1, m2, m3 = st.columns(4)
     m0.metric("Total Incidents Analysed", len(st.session_state.df))
@@ -381,15 +408,13 @@ if st.session_state.groups:
     m3.metric("Applications Affected", len(applications))
 
     st.subheader("Groups by Application")
-
     sorted_groups = sorted(groups, key=lambda g: g.get("count", 0), reverse=True)
 
     for app in sorted({g.get("application", "Unknown") for g in sorted_groups},
                       key=lambda a: sum(g["count"] for g in sorted_groups if g.get("application") == a),
                       reverse=True):
         app_groups = [g for g in sorted_groups if g.get("application") == app]
-        app_total = sum(g.get("count", 0) for g in app_groups)
-
+        app_total  = sum(g.get("count", 0) for g in app_groups)
         with st.expander(f"{app}  —  {app_total} incident{'s' if app_total != 1 else ''}"):
             for g in app_groups:
                 st.markdown(f"**Issue:** {g.get('issue', '')}")
@@ -397,22 +422,26 @@ if st.session_state.groups:
                 cols[0].metric("Count", g.get("count", 0))
                 cols[1].markdown(f"**Business Impact**\n\n{g.get('business_impact', '')}")
                 cols[2].markdown(f"**Recommended Action**\n\n{g.get('recommended_action', '')}")
-
                 inc_nums = g.get("incident_numbers", [])
                 if inc_nums:
                     st.caption("Incidents: " + " · ".join(inc_nums))
                 st.divider()
 
-    # ── Excel export ──
+    # ── Save ──
+    st.subheader("Save Monthly Data")
+    if st.button(f"Save {selected_month} {selected_year} Data", type="secondary"):
+        raw_path, proc_path = save_monthly_data(st.session_state.df, groups, selected_year, selected_month)
+        st.success(f"Saved:\n- `{raw_path}`\n- `{proc_path}`")
+
+    # ── Excel Export ──
     st.subheader("Export")
     missing_ids = st.session_state.missing_ids or []
     unaccounted_df = (
         st.session_state.df[st.session_state.df["number"].astype(str).isin(missing_ids)]
         if missing_ids else None
     )
-    excel_bytes = build_excel(groups, unaccounted_df)
+    excel_bytes    = build_excel(groups, unaccounted_df)
     excel_filename = f"universal_request_incident_patterns_{selected_year}-{selected_month}.xlsx"
-
     st.download_button(
         label="Download Excel Report",
         data=excel_bytes,
@@ -420,3 +449,58 @@ if st.session_state.groups:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
     )
+
+    # ── History & Trends ──
+    st.divider()
+    st.subheader("Monthly Trends")
+    history = load_history()
+
+    if len(history) < 2:
+        st.info("Save data for 2 or more months to see trend analysis.")
+    else:
+        # Build flat records: one row per group per month
+        rows_hist = []
+        for record in history:
+            label = f"{record['month']} {record['year']}"
+            for g in record.get("groups", []):
+                rows_hist.append({
+                    "month_label": label,
+                    "year":        record["year"],
+                    "month":       record["month"],
+                    "application": g.get("application", "Unknown"),
+                    "issue":       g.get("issue", ""),
+                    "count":       g.get("count", 0),
+                })
+
+        hist_df = pd.DataFrame(rows_hist)
+        month_order = [f"{m} {y}" for y in sorted(hist_df["year"].unique(), reverse=True)
+                       for m in months if f"{m} {y}" in hist_df["month_label"].values]
+
+        # Top recurring applications across months
+        app_month_counts = (
+            hist_df.groupby(["application", "month_label"])["count"]
+            .sum()
+            .unstack(fill_value=0)
+            .reindex(columns=[m for m in month_order if m in hist_df["month_label"].values])
+        )
+        app_month_counts["Total"] = app_month_counts.sum(axis=1)
+        app_month_counts["Months Active"] = (app_month_counts.drop(columns="Total") > 0).sum(axis=1)
+        app_month_counts = app_month_counts.sort_values("Total", ascending=False)
+
+        st.markdown("**Applications by Month (incident count)**")
+
+        # Highlight apps recurring 3+ consecutive months
+        def highlight_recurring(row):
+            color = "background-color: #fff3cd" if row["Months Active"] >= 3 else ""
+            return [color] * len(row)
+
+        st.dataframe(
+            app_month_counts.style.apply(highlight_recurring, axis=1),
+            use_container_width=True
+        )
+        st.caption("Amber rows = application appeared in 3 or more months")
+
+        # Bar chart: top 10 applications by total incidents
+        top10 = app_month_counts.head(10)["Total"].sort_values(ascending=True)
+        st.markdown("**Top 10 Applications — Total Incidents Across All Months**")
+        st.bar_chart(top10)
