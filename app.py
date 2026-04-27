@@ -58,30 +58,20 @@ def preprocess(text: str, maxlen: int = 200) -> str:
 def build_grouping_prompt(rows: list[dict]) -> str:
     n = len(rows)
     incidents = "\n".join(f"{i+1}. [{r['number']}] {r['description']}" for i, r in enumerate(rows))
-    return f"""⚠ CRITICAL: Every incident number must appear in exactly one group. PREFER MORE GROUPS OVER FEWER.
+    return f"""⚠ CRITICAL: Every incident number must appear in exactly one group.
 
 <instructions>
-You are a meticulous IT incident categoriser for an Investment Bank. Your job is precise, granular categorisation — not summarisation.
+You are a business analyst grouping {n} IT incidents from an Investment Bank for senior management reporting.
 
-A group is only valid if ALL three conditions are true:
-1. Every incident in the group involves the exact same application or system
-2. Every incident describes the exact same specific failure mode, error, or request type
-3. Resolving one incident would resolve all others in the group
+Group incidents together if they share the same root cause OR if they represent repeated requests for the same operational process or workflow (e.g. repeated requests to create Storm IDs, repeated manual report retriggers, repeated access provisioning for the same system).
 
-GRANULARITY RULES:
-- Same application but different issue = DIFFERENT groups
-- Same issue type but different application = DIFFERENT groups
-- "Bloomberg access issues" is NOT a valid group — it is too vague
-- "Bloomberg Terminal — users locked out after AD password reset" is a valid group
-- "Bloomberg Terminal — market data feed not refreshing" is a SEPARATE group from the above
-- "Charles River — incorrect pricing data" and "Charles River — calendar sync failure" are TWO groups
-
-Do NOT merge incidents just because they share the same application.
-Do NOT merge incidents just because they are both "access" or "performance" issues.
-When in doubt — create SEPARATE groups rather than merging.
-Groups of 1 are correct and expected for unique issues.
-
-⚠ If you create a group with more than 12 incidents, you have almost certainly been too broad. Split it into more specific sub-groups before returning.
+Rules:
+- Be specific: "Users locked out after AD password reset on Bloomberg Terminal" not "access issue"
+- Same application but different problem = different groups (Bloomberg login issues ≠ Bloomberg data feed issues)
+- Different applications = always different groups
+- Include unique incidents as their own group of 1 — do not omit any incident
+- Do NOT put the same incident number in more than one group
+- Do NOT add incident numbers that were not provided
 
 Output format — plain text only, no JSON, no descriptions:
 Group 1: UR001, UR004, UR012
@@ -89,9 +79,7 @@ Group 2: UR002
 Group 3: UR003, UR007, UR099
 </instructions>
 
-⚠ CRITICAL: Before returning, verify two things:
-1. Every incident number appears exactly once across all groups. You received {n}. Count must equal {n}.
-2. No group has more than 12 incidents. If one does, split it.
+⚠ CRITICAL: Before returning, count every incident number in your output. You received {n}. Count must equal {n}. Fix any missing before returning.
 
 <incidents>
 {incidents}
