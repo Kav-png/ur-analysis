@@ -5,7 +5,6 @@ from datetime import datetime
 from pathlib import Path
 
 import altair as alt
-
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
@@ -29,7 +28,7 @@ months = [
 years = [str(y) for y in range(now.year, now.year - 5, -1)]
 
 # ── session state ──────────────────────────────────────────────────────────────
-for key in ("df", "grouping_prompt", "raw_groups", "enrichment_prompt", "groups", "missing_ids"):
+for key in ("df", "batches", "batch_size", "all_groups", "missing_ids"):
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -55,153 +54,115 @@ def preprocess(text: str, maxlen: int = 200) -> str:
     return text[:maxlen]
 
 
-def build_grouping_prompt(rows: list[dict]) -> str:
-    n = len(rows)
-    incidents = "\n".join(f"{i+1}. [{r['number']}] {r['description']}" for i, r in enumerate(rows))
-    return f"""⚠ CRITICAL: Every incident number must appear in exactly one group.
-
-<instructions>
-You are a business analyst grouping {n} IT incidents from an Investment Bank for senior management reporting.
-
-Group incidents together if they share the same root cause OR if they represent repeated requests for the same operational process or workflow (e.g. repeated requests to create Storm IDs, repeated manual report retriggers, repeated access provisioning for the same system).
+def build_prompt(rows: list[dict]) -> str:
+    incidents = "\n".join(
+        f"{i+1}. [{r['number']}] {r['description']}" for i, r in enumerate(rows)
+    )
+    return f"""You are analyzing {len(rows)} IT incidents from an Investment Bank.
+Your output will be used by senior management to reduce recurring incidents.
 
 Rules:
-- Be specific: "Users locked out after AD password reset on Bloomberg Terminal" not "access issue"
-- Same application but different problem = different groups (Bloomberg login issues ≠ Bloomberg data feed issues)
-- Different applications = always different groups
-- Include unique incidents as their own group of 1 — do not omit any incident
-- Do NOT put the same incident number in more than one group
-- Do NOT add incident numbers that were not provided
+- Extract the application or system name from the description text.
+- Group incidents together if they share the same root cause OR if they represent repeated requests for the same operational process or workflow (e.g., repeated requests to create Storm IDs, repeated manual report retriggers, etc.).
+- Be specific: write "Users locked out after AD password reset" not "access issue".
+- If only one incident exists for a particular issue, include it as its own group (do not omit unique incidents).
+- Every incident must appear in the output, either as part of a group or as its own group. Do not omit any incident for any reason.
+- If the application cannot be identified from the text, use "Unknown System".
+- Return ONLY valid JSON — no markdown fences, no explanation, nothing else.
 
-Output format — plain text only, no JSON, no descriptions:
-Group 1: UR001, UR004, UR012
-Group 2: UR002
-Group 3: UR003, UR007, UR099
-</instructions>
+Output format:
+{{
+  "groups": [
+    {{
+      "application": "name of the system or application",
+      "issue": "precise description of the problem or request",
+      "count": <number>,
+      "incident_numbers": ["INC001", "INC002"],
+      "business_impact": "one sentence describing the business effect",
+      "recommended_action": "one concrete action to prevent recurrence or address the issue"
+    }}
+  ]
+}}
 
-⚠ CRITICAL: Before returning, count every incident number in your output. You received {n}. Count must equal {n}. Fix any missing before returning.
-
-<incidents>
+Incidents:
 {incidents}
-</incidents>"""
-
-
-def parse_grouping_response(raw: str) -> dict[str, list[str]] | None:
-    groups: dict[str, list[str]] = {}
-    seen: set[str] = set()
-    for line in raw.strip().splitlines():
-        m = re.match(r'[Gg]roup\s*\d+\s*[:\-]\s*(.+)', line.strip())
-        if m:
-            ids = []
-            for x in m.group(1).split(','):
-                key = x.strip()
-                if key and key not in seen:
-                    seen.add(key)
-                    ids.append(key)
-            if ids:
-                groups[f"Group {len(groups)+1}"] = ids
-    return groups if groups else None
-
-
-def build_enrichment_prompt(raw_groups: dict[str, list[str]], df: pd.DataFrame) -> str:
-    id_to_desc = dict(zip(df["number"].astype(str), df["description"]))
-    summaries = []
-    for label, ids in raw_groups.items():
-        descs = [id_to_desc.get(i, "") for i in ids if id_to_desc.get(i)]
-        # Pass up to 3 sample descriptions so the AI has enough context to label precisely
-        samples = sorted(descs, key=len, reverse=True)[:3]
-        sample_text = " | ".join(s[:180] for s in samples) if samples else "No description available"
-        summaries.append(f"{label} ({len(ids)} incident{'s' if len(ids) != 1 else ''}): {sample_text}")
-    groups_text = "\n".join(summaries)
-    g = len(raw_groups)
-    return f"""You are enriching {g} pre-formed incident groups for senior management reporting at an Investment Bank.
-
-Each group has already been categorised — your job is to label it precisely and assess its business impact.
-
-Example — use exactly this JSON structure for each group:
-{{"app":"Bloomberg Terminal","iss":"Users locked out after overnight AD sync failure — authentication tokens not refreshed","imp":"Traders unable to access live pricing at market open, requiring manual workaround","act":"Schedule AD sync outside trading hours and add token refresh validation"}}
-
-Now enrich all {g} groups. Return a single JSON object:
-{{"g":[{{"app":"...","iss":"...","imp":"...","act":"..."}}]}}
-
-Rules:
-- "app": specific application name — include the module if known (e.g. "Charles River IMS" not just "Charles River")
-- "iss": precise issue — include the specific failure mode, not a category (e.g. "calendar sync not reflecting market holidays" not "calendar issue")
-- "imp": one sentence on the concrete business effect (who is affected and how)
-- "act": one specific, actionable recommendation — not generic advice
-- Return ONLY valid JSON — no markdown fences, no explanation
-
-<groups>
-{groups_text}
-</groups>"""
+"""
 
 
 def normalise_quotes(text: str) -> str:
     return (text
-        .replace('“', '"').replace('”', '"')   # curly double quotes
-        .replace('‘', "'").replace('’', "'")   # curly single quotes
-        .replace('′', "'").replace('″', '"')   # prime characters
-        .replace('﻿', '')                            # BOM
+        .replace('“', '"').replace('”', '"')
+        .replace('‘', "'").replace('’', "'")
+        .replace('′', "'").replace('″', '"')
+        .replace('﻿', '')
     )
 
 
-def parse_enrichment_response(raw: str, raw_groups: dict[str, list[str]]) -> list[dict] | None:
+def parse_response(raw: str) -> list[dict] | None:
     cleaned = re.sub(r"```json|```", "", raw).strip()
     cleaned = normalise_quotes(cleaned)
-    # Extract the outermost JSON object even if the AI added surrounding text
     json_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
     if json_match:
         cleaned = json_match.group(0)
     try:
         data = json.loads(cleaned)
-        enriched = data.get("g") or data.get("groups", [])
+        raw_groups = data.get("groups") or data.get("g", [])
     except json.JSONDecodeError:
         return None
 
-    group_labels = list(raw_groups.keys())
-    result = []
-    for idx, e in enumerate(enriched):
-        label = group_labels[idx] if idx < len(group_labels) else f"Group {idx+1}"
-        ids = raw_groups.get(label, [])
-        result.append({
-            "application":        e.get("app") or e.get("application", "Unknown System"),
-            "issue":              e.get("iss") or e.get("issue", ""),
-            "incident_numbers":   ids,
-            "count":              len(ids),
-            "business_impact":    e.get("imp") or e.get("business_impact", ""),
-            "recommended_action": e.get("act") or e.get("recommended_action", ""),
+    groups = []
+    seen: set[str] = set()
+    for g in raw_groups:
+        ids_raw = g.get("incident_numbers") or g.get("ids", [])
+        unique_ids = []
+        for n in ids_raw:
+            key = str(n).strip()
+            if key and key not in seen:
+                seen.add(key)
+                unique_ids.append(key)
+        if not unique_ids:
+            continue
+        groups.append({
+            "application":        g.get("application") or g.get("app", "Unknown System"),
+            "issue":              g.get("issue") or g.get("iss", ""),
+            "incident_numbers":   unique_ids,
+            "count":              len(unique_ids),
+            "business_impact":    g.get("business_impact") or g.get("imp", ""),
+            "recommended_action": g.get("recommended_action") or g.get("act", ""),
         })
-    return result
+    return groups
 
 
-def save_monthly_data(df: pd.DataFrame, groups: list[dict], year: str, month: str) -> tuple[str, str]:
-    DATA_DIR.mkdir(exist_ok=True)
-    raw_path  = DATA_DIR / f"raw_data_{year}_{month}.csv"
-    proc_path = DATA_DIR / f"processed_data_{year}_{month}.json"
-    df[["number", "description_raw"]].to_csv(raw_path, index=False)
-    proc_path.write_text(json.dumps({"year": year, "month": month, "groups": groups}, indent=2))
-    return str(raw_path), str(proc_path)
-
-
-def load_history() -> list[dict]:
-    if not DATA_DIR.exists():
-        return []
-    records = []
-    for f in sorted(DATA_DIR.glob("processed_data_*.json")):
-        try:
-            records.append(json.loads(f.read_text()))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return records
+def merge_all_batches(batches: list[dict]) -> list[dict]:
+    """Merge groups from all completed batches, deduplicating incident numbers."""
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for batch in batches:
+        for g in batch.get("groups", []):
+            unique_ids = [n for n in g["incident_numbers"] if n not in seen]
+            seen.update(unique_ids)
+            if unique_ids:
+                # Check if a group with same application+issue already exists (cross-batch duplicate)
+                existing = next(
+                    (m for m in merged
+                     if m["application"].lower() == g["application"].lower()
+                     and m["issue"].lower() == g["issue"].lower()),
+                    None
+                )
+                if existing:
+                    existing["incident_numbers"].extend(unique_ids)
+                    existing["count"] = len(existing["incident_numbers"])
+                else:
+                    merged.append({**g, "incident_numbers": unique_ids, "count": len(unique_ids)})
+    return merged
 
 
 def build_excel(groups: list[dict], unaccounted_df: pd.DataFrame | None = None) -> bytes:
     wb = Workbook()
-    header_font  = Font(bold=True, color="FFFFFF")
-    header_fill  = PatternFill("solid", fgColor="1F3864")
-    alt_fill     = PatternFill("solid", fgColor="DCE6F1")
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="1F3864")
+    alt_fill    = PatternFill("solid", fgColor="DCE6F1")
 
-    # ── Sheet 1: Management Summary ──
     ws1 = wb.active
     ws1.title = "Management Summary"
     headers = ["Application", "Issue", "Count", "Business Impact", "Recommended Action"]
@@ -224,7 +185,6 @@ def build_excel(groups: list[dict], unaccounted_df: pd.DataFrame | None = None) 
     for i, width in enumerate([28, 48, 10, 48, 48], 1):
         ws1.column_dimensions[get_column_letter(i)].width = width
 
-    # ── Sheet 2: Incident Detail ──
     ws2 = wb.create_sheet("Incident Detail")
     detail_headers = ["Group", "Application", "Issue", "Incident Numbers"]
     ws2.append(detail_headers)
@@ -241,12 +201,10 @@ def build_excel(groups: list[dict], unaccounted_df: pd.DataFrame | None = None) 
     for col_idx, width in enumerate([8, 28, 48, 60], 1):
         ws2.column_dimensions[get_column_letter(col_idx)].width = width
 
-    # ── Sheet 3: Unaccounted (only if gaps remain) ──
     if unaccounted_df is not None and not unaccounted_df.empty:
         ws3 = wb.create_sheet("Unaccounted")
-        ua_headers = ["Incident Number", "Description"]
-        ws3.append(ua_headers)
-        for col_idx, _ in enumerate(ua_headers, 1):
+        ws3.append(["Incident Number", "Description"])
+        for col_idx in range(1, 3):
             cell = ws3.cell(row=1, column=col_idx)
             cell.font = header_font
             cell.fill = PatternFill("solid", fgColor="C00000")
@@ -260,6 +218,27 @@ def build_excel(groups: list[dict], unaccounted_df: pd.DataFrame | None = None) 
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def save_monthly_data(df: pd.DataFrame, groups: list[dict], year: str, month: str) -> tuple[str, str]:
+    DATA_DIR.mkdir(exist_ok=True)
+    raw_path  = DATA_DIR / f"raw_data_{year}_{month}.csv"
+    proc_path = DATA_DIR / f"processed_data_{year}_{month}.json"
+    df[["number", "description_raw"]].to_csv(raw_path, index=False)
+    proc_path.write_text(json.dumps({"year": year, "month": month, "groups": groups}, indent=2))
+    return str(raw_path), str(proc_path)
+
+
+def load_history() -> list[dict]:
+    if not DATA_DIR.exists():
+        return []
+    records = []
+    for f in sorted(DATA_DIR.glob("processed_data_*.json")):
+        try:
+            records.append(json.loads(f.read_text()))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return records
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -295,144 +274,146 @@ if uploaded:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Pass 1: Grouping
+# STEP 2 — Configure Batches & Generate Prompts
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.df is not None:
     st.divider()
-    st.header("Step 2 — Group Incidents (Pass 1 of 2)")
-    st.caption("This prompt asks the AI to assign every incident to a group. Output is plain text — always fits within AI response limits.")
+    st.header("Step 2 — Configure & Analyse Batches")
 
-    if st.button("Generate Grouping Prompt", type="primary"):
-        rows = st.session_state.df[["number", "description"]].to_dict("records")
-        st.session_state.grouping_prompt = build_grouping_prompt(rows)
-        # Reset downstream state when regenerating
-        st.session_state.raw_groups = None
-        st.session_state.enrichment_prompt = None
-        st.session_state.groups = None
-
-    if st.session_state.grouping_prompt:
-        st.info("Copy the prompt below and paste it into Claude, ChatGPT, or your AI tool. The AI will return a plain list of groups.")
-        preview = "\n".join(st.session_state.grouping_prompt.splitlines()[:12])
-        st.code(preview + "\n...", language=None)
-        with st.expander("Show full grouping prompt"):
-            st.code(st.session_state.grouping_prompt, language=None)
-        copy_button(st.session_state.grouping_prompt, tooltip="Copy grouping prompt", copied_label="Copied!", icon="st")
-        st.markdown(
-            """<a href="https://goto/red" target="_blank">
-                <button style="background-color:red;color:white;padding:0.5em 1.5em;border:none;border-radius:4px;font-size:1em;cursor:pointer;">
-                    Go to Red Portal
-                </button>
-            </a>""",
-            unsafe_allow_html=True
-        )
-
-        st.subheader("Paste Grouping Response")
-        grouping_response = st.text_area(
-            "Paste the AI response here (plain text groups)",
-            height=200,
-            placeholder="Group 1: UR001, UR004, UR012\nGroup 2: UR002\nGroup 3: UR003, UR007",
-            key="grouping_textarea"
-        )
-
-        if st.button("Process Grouping", type="primary", key="process_grouping"):
-            if not grouping_response.strip():
-                st.warning("Paste the AI grouping response before processing.")
-            else:
-                raw_groups = parse_grouping_response(grouping_response)
-                if not raw_groups:
-                    st.error("Could not parse groups from the response. Make sure the AI returned lines like 'Group 1: UR001, UR002'.")
-                else:
-                    st.session_state.raw_groups = raw_groups
-
-                    # Coverage check
-                    all_ids = set(st.session_state.df["number"].astype(str))
-                    covered_ids = {n for ids in raw_groups.values() for n in ids}
-                    missing = sorted(all_ids - covered_ids)
-                    st.session_state.missing_ids = missing
-
-                    total_groups = len(raw_groups)
-                    total_covered = len(covered_ids)
-
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Groups Found", total_groups)
-                    c2.metric("Incidents Assigned", total_covered)
-                    c3.metric("Missing", len(missing))
-
-                    if not missing:
-                        st.success(f"All {len(all_ids)} incidents assigned to groups.")
-                    else:
-                        st.warning(f"⚠ {len(missing)} incidents not found in the grouping response. They will be listed in the Unaccounted sheet.")
-                        missing_df = st.session_state.df[st.session_state.df["number"].astype(str).isin(missing)]
-                        with st.expander(f"Show {len(missing)} unassigned incidents"):
-                            st.dataframe(missing_df[["number", "description_raw"]], use_container_width=True, hide_index=True)
-
-                    # Auto-generate enrichment prompt
-                    st.session_state.enrichment_prompt = build_enrichment_prompt(raw_groups, st.session_state.df)
-                    st.success(f"Grouping complete. Enrichment prompt ready in Step 3.")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Pass 2: Enrichment
-# ══════════════════════════════════════════════════════════════════════════════
-if st.session_state.enrichment_prompt:
-    st.divider()
-    st.header("Step 3 — Enrich Groups (Pass 2 of 2)")
-    st.caption("This prompt sends only the group summaries — not all 300 incidents — so the AI response is small and complete.")
-
-    st.info("Copy the prompt below and paste it into your AI tool. The AI will return JSON with application names, issue descriptions, business impact, and recommended actions.")
-    preview = "\n".join(st.session_state.enrichment_prompt.splitlines()[:12])
-    st.code(preview + "\n...", language=None)
-    with st.expander("Show full enrichment prompt"):
-        st.code(st.session_state.enrichment_prompt, language=None)
-    copy_button(st.session_state.enrichment_prompt, tooltip="Copy enrichment prompt", copied_label="Copied!", icon="st")
-
-    enrichment_response = st.text_area(
-        "Paste the AI enrichment response here (JSON)",
-        height=250,
-        placeholder='{"g":[{"app":"Bloomberg","iss":"...","imp":"...","act":"..."}]}',
-        key="enrichment_textarea"
+    total = len(st.session_state.df)
+    batch_size = st.slider(
+        "Incidents per batch", min_value=25, max_value=150, value=75, step=25,
+        help="Smaller batches = more paste-backs but better AI coverage per batch. 50–75 is the sweet spot."
     )
 
-    if st.button("Process Enrichment", type="primary", key="process_enrichment"):
-        if not enrichment_response.strip():
-            st.warning("Paste the AI enrichment response before processing.")
-        else:
-            groups = parse_enrichment_response(enrichment_response, st.session_state.raw_groups)
-            print(enrichment_response)
-            print(groups)
-            if groups is None:
-                st.error("Could not parse the response as JSON. Make sure you copied the full response.")
-                with st.expander("Debug — show what was received"):
-                    st.text(f"Length: {len(enrichment_response)} chars")
-                    st.text(f"First 300 chars:\n{enrichment_response[:300]}")
-                    st.text(f"Last 100 chars:\n{enrichment_response[-100:]}")
-            elif len(groups) == 0:
-                st.warning("No groups were parsed. Try re-running the enrichment prompt.")
-            else:
-                st.session_state.groups = groups
-                st.success(f"Enrichment complete — {len(groups)} groups ready.")
+    n_batches = -(-total // batch_size)  # ceiling division
+    st.caption(f"{total} incidents → **{n_batches} batch{'es' if n_batches != 1 else ''}** of up to {batch_size}")
+
+    if st.button("Generate Batch Prompts", type="primary"):
+        rows = st.session_state.df[["number", "description"]].to_dict("records")
+        batches = []
+        for i in range(n_batches):
+            chunk = rows[i * batch_size: (i + 1) * batch_size]
+            batches.append({
+                "index":   i,
+                "rows":    chunk,
+                "prompt":  build_prompt(chunk),
+                "groups":  None,
+                "complete": False,
+            })
+        st.session_state.batches       = batches
+        st.session_state.batch_size    = batch_size
+        st.session_state.all_groups    = None
+        st.session_state.missing_ids   = None
+
+    if st.session_state.batches:
+        batches = st.session_state.batches
+        completed = sum(1 for b in batches if b["complete"])
+        covered   = sum(len(n) for b in batches if b["complete"]
+                        for g in (b["groups"] or []) for n in [g["incident_numbers"]])
+
+        # Overall progress bar
+        st.progress(completed / len(batches), text=f"{completed}/{len(batches)} batches complete")
+
+        tab_labels = [
+            f"{'✅' if b['complete'] else '⏳'} Batch {b['index']+1} ({len(b['rows'])} incidents)"
+            for b in batches
+        ]
+        tabs = st.tabs(tab_labels)
+
+        for tab, batch in zip(tabs, batches):
+            with tab:
+                inc_range = f"{batch['index']*st.session_state.batch_size + 1}–{batch['index']*st.session_state.batch_size + len(batch['rows'])}"
+                st.caption(f"Incidents {inc_range} of {total}")
+
+                if batch["complete"]:
+                    st.success(f"Complete — {sum(g['count'] for g in batch['groups'])} incidents grouped into {len(batch['groups'])} groups")
+                else:
+                    st.info("Copy the prompt below, paste into your AI tool, then paste the response back here.")
+
+                preview = "\n".join(batch["prompt"].splitlines()[:10])
+                st.code(preview + "\n...", language=None)
+                with st.expander("Show full prompt"):
+                    st.code(batch["prompt"], language=None)
+
+                copy_button(batch["prompt"], tooltip=f"Copy Batch {batch['index']+1} prompt",
+                            copied_label="Copied!", icon="st")
+                st.markdown(
+                    """<a href="https://goto/red" target="_blank">
+                        <button style="background-color:red;color:white;padding:0.5em 1.5em;border:none;border-radius:4px;font-size:1em;cursor:pointer;">
+                            Go to Red Portal
+                        </button>
+                    </a>""",
+                    unsafe_allow_html=True
+                )
+
+                response_key = f"response_batch_{batch['index']}"
+                raw_response = st.text_area(
+                    "Paste AI response here",
+                    height=200,
+                    key=response_key,
+                    placeholder='{"groups": [{"application": "...", "issue": "...", ...}]}'
+                )
+
+                if st.button(f"Process Batch {batch['index']+1}", type="primary",
+                             key=f"process_{batch['index']}"):
+                    if not raw_response.strip():
+                        st.warning("Paste the AI response before processing.")
+                    else:
+                        groups = parse_response(raw_response)
+                        if groups is None:
+                            st.error("Could not parse as JSON.")
+                            with st.expander("Debug — show received text"):
+                                st.text(f"First 300 chars:\n{raw_response[:300]}")
+                                st.text(f"Last 100 chars:\n{raw_response[-100:]}")
+                        elif len(groups) == 0:
+                            st.warning("No groups found — try re-running the prompt.")
+                        else:
+                            st.session_state.batches[batch["index"]]["groups"]   = groups
+                            st.session_state.batches[batch["index"]]["complete"] = True
+                            # Recompute merged groups
+                            st.session_state.all_groups = merge_all_batches(st.session_state.batches)
+                            # Recompute coverage
+                            all_ids     = set(st.session_state.df["number"].astype(str))
+                            covered_ids = {n for g in st.session_state.all_groups
+                                           for n in g["incident_numbers"]}
+                            st.session_state.missing_ids = sorted(all_ids - covered_ids)
+                            st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — Results, Save & History
+# STEP 3 — Results & Export
 # ══════════════════════════════════════════════════════════════════════════════
-if st.session_state.groups:
+if st.session_state.all_groups:
     st.divider()
-    st.header("Step 4 — Results")
+    st.header("Step 3 — Results")
+
+    groups       = st.session_state.all_groups
+    missing_ids  = st.session_state.missing_ids or []
+    batches_done = sum(1 for b in (st.session_state.batches or []) if b["complete"])
+    batches_total= len(st.session_state.batches or [])
 
     col_month, col_year = st.columns([2, 1])
     selected_month = col_month.selectbox("Report Month", months, index=now.month - 1)
     selected_year  = col_year.selectbox("Report Year", years, index=0)
 
-    groups = st.session_state.groups
     total_covered = sum(g.get("count", 0) for g in groups)
     applications  = sorted({g.get("application", "Unknown") for g in groups})
 
-    m0, m1, m2, m3 = st.columns(4)
-    m0.metric("Total Incidents Analysed", len(st.session_state.df))
-    m1.metric("Incident Groups", len(groups))
-    m2.metric("Incidents Covered", total_covered)
-    m3.metric("Applications Affected", len(applications))
+    m0, m1, m2, m3, m4 = st.columns(5)
+    m0.metric("Total Incidents",    len(st.session_state.df))
+    m1.metric("Batches Complete",   f"{batches_done}/{batches_total}")
+    m2.metric("Incidents Covered",  total_covered)
+    m3.metric("Groups Found",       len(groups))
+    m4.metric("Applications",       len(applications))
+
+    if missing_ids:
+        st.warning(f"⚠ {len(missing_ids)} incidents not yet covered — complete remaining batches or check AI responses.")
+        with st.expander(f"Show {len(missing_ids)} uncovered incidents"):
+            missing_df = st.session_state.df[st.session_state.df["number"].astype(str).isin(missing_ids)]
+            st.dataframe(missing_df[["number", "description_raw"]], use_container_width=True, hide_index=True)
+    else:
+        st.success(f"All {len(st.session_state.df)} incidents covered across {batches_done} batches.")
 
     st.subheader("Groups by Application")
     sorted_groups = sorted(groups, key=lambda g: g.get("count", 0), reverse=True)
@@ -462,7 +443,6 @@ if st.session_state.groups:
 
     # ── Excel Export ──
     st.subheader("Export")
-    missing_ids = st.session_state.missing_ids or []
     unaccounted_df = (
         st.session_state.df[st.session_state.df["number"].astype(str).isin(missing_ids)]
         if missing_ids else None
@@ -485,9 +465,11 @@ if st.session_state.groups:
     if len(history) < 2:
         st.info("Save data for 2 or more months to see trend analysis.")
     else:
-        # Build flat records: one row per group per month
         rows_hist = []
-        for record in history:
+        month_idx = {m: i for i, m in enumerate(months)}
+        sorted_history = sorted(history, key=lambda r: (int(r["year"]), month_idx.get(r["month"], 0)))
+
+        for record in sorted_history:
             label = f"{record['month']} {record['year']}"
             for g in record.get("groups", []):
                 rows_hist.append({
@@ -495,49 +477,37 @@ if st.session_state.groups:
                     "year":        record["year"],
                     "month":       record["month"],
                     "application": g.get("application", "Unknown"),
-                    "issue":       g.get("issue", ""),
                     "count":       g.get("count", 0),
                 })
 
-        hist_df = pd.DataFrame(rows_hist)
-        month_order = [f"{m} {y}" for y in sorted(hist_df["year"].unique(), reverse=True)
-                       for m in months if f"{m} {y}" in hist_df["month_label"].values]
+        hist_df    = pd.DataFrame(rows_hist)
+        month_order = [f"{r['month']} {r['year']}" for r in sorted_history]
 
-        # Top recurring applications across months
+        # Applications by month pivot
         app_month_counts = (
             hist_df.groupby(["application", "month_label"])["count"]
-            .sum()
-            .unstack(fill_value=0)
+            .sum().unstack(fill_value=0)
             .reindex(columns=[m for m in month_order if m in hist_df["month_label"].values])
         )
-        app_month_counts["Total"] = app_month_counts.sum(axis=1)
+        app_month_counts["Total"]         = app_month_counts.sum(axis=1)
         app_month_counts["Months Active"] = (app_month_counts.drop(columns="Total") > 0).sum(axis=1)
         app_month_counts = app_month_counts.sort_values("Total", ascending=False)
 
         st.markdown("**Applications by Month (incident count)**")
 
-        # Highlight apps recurring 3+ consecutive months
         def highlight_recurring(row):
             color = "background-color: #fff3cd" if row["Months Active"] >= 3 else ""
             return [color] * len(row)
 
-        st.dataframe(
-            app_month_counts.style.apply(highlight_recurring, axis=1),
-            use_container_width=True
-        )
+        st.dataframe(app_month_counts.style.apply(highlight_recurring, axis=1), use_container_width=True)
         st.caption("Amber rows = application appeared in 3 or more months")
 
-        # ── Monthly volume chart with moving average + target line ──
+        # Monthly volume chart
         st.markdown("**Monthly Incident Volume**")
-
         target_pct = st.slider(
-            "Target reduction per month (%)", min_value=1, max_value=30, value=10, step=1,
-            help="Red dashed line shows the target if incidents reduce by this % each month from the first saved month"
+            "Target reduction per month (%)", min_value=1, max_value=30, value=10, step=1
         )
 
-        # Build monthly totals in chronological order
-        month_idx = {m: i for i, m in enumerate(months)}
-        sorted_history = sorted(history, key=lambda r: (int(r["year"]), month_idx.get(r["month"], 0)))
         monthly_rows = []
         for record in sorted_history:
             label = f"{record['month'][:3]} {record['year']}"
@@ -545,24 +515,17 @@ if st.session_state.groups:
             monthly_rows.append({"month": label, "total": total})
 
         df_vol = pd.DataFrame(monthly_rows)
-        df_vol["order"] = range(len(df_vol))
-
-        # 3-month rolling moving average
-        df_vol["moving_avg"] = df_vol["total"].rolling(window=3, min_periods=1).mean().round(1)
-
-        # Target reduction line starting from first month
-        baseline = df_vol["total"].iloc[0]
-        df_vol["target"] = [round(baseline * ((1 - target_pct / 100) ** i), 1) for i in range(len(df_vol))]
-
-        # Bar colour: amber if above moving average, steel blue if at or below
-        df_vol["status"] = df_vol.apply(
+        df_vol["order"]       = range(len(df_vol))
+        df_vol["moving_avg"]  = df_vol["total"].rolling(window=3, min_periods=1).mean().round(1)
+        baseline              = df_vol["total"].iloc[0]
+        df_vol["target"]      = [round(baseline * ((1 - target_pct / 100) ** i), 1) for i in range(len(df_vol))]
+        df_vol["status"]      = df_vol.apply(
             lambda r: "Above average" if r["total"] > r["moving_avg"] else "At or below average", axis=1
         )
 
         base = alt.Chart(df_vol).encode(
             x=alt.X("month:N", sort=None, title="Month", axis=alt.Axis(labelAngle=-30))
         )
-
         bars = base.mark_bar(opacity=0.85).encode(
             y=alt.Y("total:Q", title="Total Incidents"),
             color=alt.Color("status:N", scale=alt.Scale(
@@ -570,30 +533,24 @@ if st.session_state.groups:
                 range=["#E07B39", "#1F3864"]
             ), legend=alt.Legend(title="vs Moving Average")),
             tooltip=[
-                alt.Tooltip("month:N", title="Month"),
-                alt.Tooltip("total:Q", title="Total Incidents"),
+                alt.Tooltip("month:N",      title="Month"),
+                alt.Tooltip("total:Q",      title="Total Incidents"),
                 alt.Tooltip("moving_avg:Q", title="3-Month Avg"),
-                alt.Tooltip("target:Q", title=f"Target (-{target_pct}%/mo)"),
+                alt.Tooltip("target:Q",     title=f"Target (-{target_pct}%/mo)"),
             ]
         )
-
         ma_line = base.mark_line(color="#F4A900", strokeWidth=2.5, point=True).encode(
-            y=alt.Y("moving_avg:Q"),
-            tooltip=[alt.Tooltip("moving_avg:Q", title="3-Month Moving Avg")]
+            y="moving_avg:Q"
         )
-
         target_line = base.mark_line(color="#C00000", strokeWidth=2, strokeDash=[6, 3]).encode(
-            y=alt.Y("target:Q"),
-            tooltip=[alt.Tooltip("target:Q", title=f"Target (-{target_pct}%/mo)")]
+            y="target:Q"
         )
-
-        chart = (bars + ma_line + target_line).properties(height=350).configure_axis(
-            labelFontSize=12, titleFontSize=13
+        st.altair_chart(
+            (bars + ma_line + target_line).properties(height=350).configure_axis(labelFontSize=12, titleFontSize=13),
+            use_container_width=True
         )
-        st.altair_chart(chart, use_container_width=True)
         st.caption("Orange line = 3-month moving average  |  Red dashed = target reduction trajectory")
 
-        # Top 10 applications by total incidents
         top10 = app_month_counts.head(10)["Total"].sort_values(ascending=True)
         st.markdown("**Top 10 Applications — Total Incidents Across All Months**")
         st.bar_chart(top10)
