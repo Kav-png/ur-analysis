@@ -131,6 +131,10 @@ Rules:
 
 def parse_enrichment_response(raw: str, raw_groups: dict[str, list[str]]) -> list[dict] | None:
     cleaned = re.sub(r"```json|```", "", raw).strip()
+    # Extract the outermost JSON object even if the AI added surrounding text
+    json_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if json_match:
+        cleaned = json_match.group(0)
     try:
         data = json.loads(cleaned)
         enriched = data.get("g") or data.get("groups", [])
