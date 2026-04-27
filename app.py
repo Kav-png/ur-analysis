@@ -58,15 +58,30 @@ def preprocess(text: str, maxlen: int = 200) -> str:
 def build_grouping_prompt(rows: list[dict]) -> str:
     n = len(rows)
     incidents = "\n".join(f"{i+1}. [{r['number']}] {r['description']}" for i, r in enumerate(rows))
-    return f"""⚠ CRITICAL: Every incident number must appear in exactly one group.
+    return f"""⚠ CRITICAL: Every incident number must appear in exactly one group. PREFER MORE GROUPS OVER FEWER.
 
 <instructions>
-Group these {n} Investment Bank IT incidents by shared root cause or repeated operational workflow.
+You are a meticulous IT incident categoriser for an Investment Bank. Your job is precise, granular categorisation — not summarisation.
 
-Do NOT put the same incident number in more than one group.
-Do NOT omit any incident number — every single one must appear in the output.
-Do NOT add incident numbers that were not in the list below.
-Groups of 1 are allowed for incidents with a unique issue.
+A group is only valid if ALL three conditions are true:
+1. Every incident in the group involves the exact same application or system
+2. Every incident describes the exact same specific failure mode, error, or request type
+3. Resolving one incident would resolve all others in the group
+
+GRANULARITY RULES:
+- Same application but different issue = DIFFERENT groups
+- Same issue type but different application = DIFFERENT groups
+- "Bloomberg access issues" is NOT a valid group — it is too vague
+- "Bloomberg Terminal — users locked out after AD password reset" is a valid group
+- "Bloomberg Terminal — market data feed not refreshing" is a SEPARATE group from the above
+- "Charles River — incorrect pricing data" and "Charles River — calendar sync failure" are TWO groups
+
+Do NOT merge incidents just because they share the same application.
+Do NOT merge incidents just because they are both "access" or "performance" issues.
+When in doubt — create SEPARATE groups rather than merging.
+Groups of 1 are correct and expected for unique issues.
+
+⚠ If you create a group with more than 12 incidents, you have almost certainly been too broad. Split it into more specific sub-groups before returning.
 
 Output format — plain text only, no JSON, no descriptions:
 Group 1: UR001, UR004, UR012
@@ -74,8 +89,9 @@ Group 2: UR002
 Group 3: UR003, UR007, UR099
 </instructions>
 
-⚠ CRITICAL: Before returning, count every incident number in your output.
-You received {n} incidents. If your total count ≠ {n}, find the missing ones and fix it before returning.
+⚠ CRITICAL: Before returning, verify two things:
+1. Every incident number appears exactly once across all groups. You received {n}. Count must equal {n}.
+2. No group has more than 12 incidents. If one does, split it.
 
 <incidents>
 {incidents}
@@ -104,26 +120,27 @@ def build_enrichment_prompt(raw_groups: dict[str, list[str]], df: pd.DataFrame) 
     summaries = []
     for label, ids in raw_groups.items():
         descs = [id_to_desc.get(i, "") for i in ids if id_to_desc.get(i)]
-        rep = max(descs, key=len)[:250] if descs else "No description available"
-        summaries.append(f"{label} ({len(ids)} incident{'s' if len(ids) != 1 else ''}): {rep}")
+        # Pass up to 3 sample descriptions so the AI has enough context to label precisely
+        samples = sorted(descs, key=len, reverse=True)[:3]
+        sample_text = " | ".join(s[:180] for s in samples) if samples else "No description available"
+        summaries.append(f"{label} ({len(ids)} incident{'s' if len(ids) != 1 else ''}): {sample_text}")
     groups_text = "\n".join(summaries)
     g = len(raw_groups)
     return f"""You are enriching {g} pre-formed incident groups for senior management reporting at an Investment Bank.
 
-For each group, identify the application and describe the issue precisely.
+Each group has already been categorised — your job is to label it precisely and assess its business impact.
 
 Example — use exactly this JSON structure for each group:
-{{"app":"Bloomberg","iss":"Users locked out after overnight AD sync failure","imp":"Traders unable to access live pricing at market open","act":"Schedule AD sync outside trading hours"}}
+{{"app":"Bloomberg Terminal","iss":"Users locked out after overnight AD sync failure — authentication tokens not refreshed","imp":"Traders unable to access live pricing at market open, requiring manual workaround","act":"Schedule AD sync outside trading hours and add token refresh validation"}}
 
-Now enrich all {g} groups below. Return a single JSON object wrapping all results:
+Now enrich all {g} groups. Return a single JSON object:
 {{"g":[{{"app":"...","iss":"...","imp":"...","act":"..."}}]}}
 
 Rules:
-- "app": name of the system or application extracted from the description
-- "iss": precise issue description — be specific, not generic
-- "imp": one sentence on business effect
-- "act": one concrete recommended action
-- If application cannot be identified, use "Unknown System"
+- "app": specific application name — include the module if known (e.g. "Charles River IMS" not just "Charles River")
+- "iss": precise issue — include the specific failure mode, not a category (e.g. "calendar sync not reflecting market holidays" not "calendar issue")
+- "imp": one sentence on the concrete business effect (who is affected and how)
+- "act": one specific, actionable recommendation — not generic advice
 - Return ONLY valid JSON — no markdown fences, no explanation
 
 <groups>
