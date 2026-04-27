@@ -17,7 +17,7 @@ st.title("Incident Pattern Analyser")
 st.caption("Surface recurring issues for senior management reporting")
 
 # ── session state ──────────────────────────────────────────────────────────────
-for key in ("df", "prompt", "groups"):
+for key in ("df", "prompt", "groups", "missing_ids", "followup_prompt"):
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -67,36 +67,27 @@ def preprocess(text: str, maxlen: int = 200) -> str:
     # Truncate to maxlen
     return text
 
-def build_prompt(rows: list[dict]) -> str:
+def build_prompt(rows: list[dict], is_followup: bool = False) -> str:
     incidents = "\n".join(
         f"{i+1}. [{r['number']}] {r['description']}" for i, r in enumerate(rows)
     )
+    context = "These are the REMAINING incidents not yet grouped. " if is_followup else ""
     return f"""You are analyzing {len(rows)} IT incidents from an Investment Bank.
-Your output will be used by senior management to reduce recurring incidents.
+{context}Your output will be used by senior management to reduce recurring incidents.
 
 Rules:
 - Extract the application or system name from the description text.
-- Group incidents together if they share the same root cause OR if they represent repeated requests for the same operational process or workflow (e.g., repeated requests to create Storm IDs, repeated manual report retriggers, etc.).
+- Group incidents together if they share the same root cause OR if they represent repeated requests for the same operational process or workflow (e.g. repeated requests to create Storm IDs, repeated manual report retriggers).
 - Be specific: write "Users locked out after AD password reset" not "access issue".
-- If only one incident exists for a particular issue, include it as its own group (do not omit unique incidents).
-- **Every incident must appear in the output, either as part of a group or as its own group. Do not omit any incident for any reason.**
+- Every incident must appear in the output — include unique incidents as their own group of 1.
 - If the application cannot be identified from the text, use "Unknown System".
 - Return ONLY valid JSON — no markdown fences, no explanation, nothing else.
 
-Output format:
-{{
-  "groups": [
-    {{
-      "application": "name of the system or application",
-      "issue": "precise description of the problem or request",
-      "count": <number>,
-      "incident_numbers": ["INC001", "INC002"],
-      "business_impact": "one sentence describing the business effect",
-      "recommended_action": "one concrete action to prevent recurrence or address the issue"
-    }}
-  ]
-}}
+Use this compact output format to keep the response small:
+{{"g":[{{"app":"application name","iss":"precise issue description","ids":["UR001","UR002"],"imp":"one-sentence business impact","act":"one concrete recommended action"}}]}}
 
+Before returning: count the total incident numbers across all "ids" arrays.
+You were given {len(rows)} incidents. If your total is less than {len(rows)}, find the missing ones and add them as individual groups before returning.
 
 Incidents:
 {incidents}
@@ -104,16 +95,27 @@ Incidents:
 
 
 def parse_response(raw: str) -> list[dict] | None:
-    # strip markdown fences if present
     cleaned = re.sub(r"```json|```", "", raw).strip()
     try:
         data = json.loads(cleaned)
-        return data.get("groups", [])
+        raw_groups = data.get("g") or data.get("groups", [])
     except json.JSONDecodeError:
         return None
+    groups = []
+    for g in raw_groups:
+        ids = g.get("ids") or g.get("incident_numbers", [])
+        groups.append({
+            "application":        g.get("app")  or g.get("application", "Unknown System"),
+            "issue":              g.get("iss")  or g.get("issue", ""),
+            "incident_numbers":   ids,
+            "count":              len(ids),
+            "business_impact":    g.get("imp")  or g.get("business_impact", ""),
+            "recommended_action": g.get("act")  or g.get("recommended_action", ""),
+        })
+    return groups
 
 
-def build_excel(groups: list[dict]) -> bytes:
+def build_excel(groups: list[dict], unaccounted_df: pd.DataFrame | None = None) -> bytes:
     wb = Workbook()
 
     # ── Sheet 1: Management Summary ──
@@ -179,6 +181,22 @@ def build_excel(groups: list[dict]) -> bytes:
 
     for col_idx, width in enumerate([8, 28, 48, 60], 1):
         ws2.column_dimensions[get_column_letter(col_idx)].width = width
+
+    # ── Sheet 3: Unaccounted Incidents (only if gaps remain) ──
+    if unaccounted_df is not None and not unaccounted_df.empty:
+        ws3 = wb.create_sheet("Unaccounted")
+        ua_headers = ["Incident Number", "Description"]
+        ws3.append(ua_headers)
+        for col_idx, _ in enumerate(ua_headers, 1):
+            cell = ws3.cell(row=1, column=col_idx)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="C00000")
+            cell.alignment = Alignment(horizontal="center")
+        ws3.freeze_panes = "A2"
+        for _, row in unaccounted_df.iterrows():
+            ws3.append([str(row["number"]), str(row["description_raw"])])
+        ws3.column_dimensions["A"].width = 20
+        ws3.column_dimensions["B"].width = 80
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -273,6 +291,52 @@ if st.session_state.prompt:
             else:
                 st.session_state.groups = groups
                 st.success(f"Parsed {len(groups)} incident groups successfully.")
+                # Coverage check
+                all_ids = set(st.session_state.df["number"].astype(str))
+                covered_ids = {str(n) for g in groups for n in g.get("incident_numbers", [])}
+                missing = sorted(all_ids - covered_ids)
+                st.session_state.missing_ids = missing
+                if not missing:
+                    st.success(f"All {len(all_ids)} incidents accounted for.")
+                else:
+                    st.warning(f"⚠ {len(missing)} of {len(all_ids)} incidents were not returned by the AI.")
+                    missing_df = st.session_state.df[st.session_state.df["number"].astype(str).isin(missing)]
+                    with st.expander(f"Show {len(missing)} unaccounted incidents"):
+                        st.dataframe(missing_df[["number", "description_raw"]], use_container_width=True, hide_index=True)
+                    followup_rows = missing_df[["number", "description"]].to_dict("records")
+                    st.session_state.followup_prompt = build_prompt(followup_rows, is_followup=True)
+
+    # Follow-up prompt for missing incidents
+    if st.session_state.missing_ids and st.session_state.followup_prompt:
+        st.divider()
+        st.subheader("Follow-up Prompt (optional)")
+        st.info("Paste this into your AI tool to group the remaining incidents, then paste the response below.")
+        preview = "\n".join(st.session_state.followup_prompt.splitlines()[:8])
+        st.code(preview + "\n...", language=None)
+        with st.expander("Show full follow-up prompt"):
+            st.code(st.session_state.followup_prompt, language=None)
+        copy_button(st.session_state.followup_prompt, tooltip="Copy follow-up prompt", copied_label="Copied!", icon="st")
+
+        followup_response = st.text_area("Paste follow-up AI response here", height=180, key="followup_textarea")
+        if st.button("Merge Follow-up Response", type="secondary"):
+            if not followup_response.strip():
+                st.warning("Paste the follow-up response before merging.")
+            else:
+                extra_groups = parse_response(followup_response)
+                if extra_groups is None:
+                    st.error("Could not parse the follow-up response as JSON.")
+                else:
+                    st.session_state.groups = st.session_state.groups + extra_groups
+                    # Recompute missing
+                    all_ids = set(st.session_state.df["number"].astype(str))
+                    covered_ids = {str(n) for g in st.session_state.groups for n in g.get("incident_numbers", [])}
+                    still_missing = sorted(all_ids - covered_ids)
+                    st.session_state.missing_ids = still_missing
+                    if not still_missing:
+                        st.success(f"All {len(all_ids)} incidents now accounted for.")
+                    else:
+                        st.warning(f"⚠ {len(still_missing)} incidents still unaccounted for — they will appear in the Excel 'Unaccounted' sheet.")
+                    st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 4 — Results & Export
@@ -320,7 +384,12 @@ if st.session_state.groups:
 
     # ── Excel export ──
     st.subheader("Export")
-    excel_bytes = build_excel(groups)
+    missing_ids = st.session_state.missing_ids or []
+    unaccounted_df = (
+        st.session_state.df[st.session_state.df["number"].astype(str).isin(missing_ids)]
+        if missing_ids else None
+    )
+    excel_bytes = build_excel(groups, unaccounted_df)
     excel_filename = f"universal_request_incident_patterns_{selected_year}-{selected_month}.xlsx"
 
     st.download_button(
