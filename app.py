@@ -9,6 +9,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
+from st_copy import copy_button
+
 st.set_page_config(page_title="Incident Pattern Analyser", layout="wide")
 
 st.title("Incident Pattern Analyser")
@@ -21,47 +23,84 @@ for key in ("df", "prompt", "groups"):
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
-def preprocess(text: str) -> str:
-    text = str(text)
-    text = re.sub(r'\b[A-Z]{2,3}\d{5,}\b', '', text)   # strip ticket IDs like INC00123
-    text = re.sub(r'\S+@\S+', '', text)                  # strip emails
-    text = re.sub(r'\b\d{5,}\b', '', text)               # strip long numbers
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text[:200]
+# Get current month and year
+now = datetime.now()
+current_month = now.strftime("%B")  # e.g., "April"
+current_year = now.year
 
+# List of months and years (e.g., last 5 years)
+months = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+]
+years = [str(y) for y in range(current_year, current_year - 5, -1)]
+
+
+def preprocess(text: str, maxlen: int = 200) -> str:
+    text = str(text)
+    # Remove ticket IDs (e.g., INC00123, UR123456)
+    text = re.sub(r'\b[A-Z]{2,4}\d{5,}\b', '', text)
+    # Remove emails
+    text = re.sub(r'\S+@\S+', '', text)
+    # Remove long numbers (likely IDs, phone numbers)
+    text = re.sub(r'\b\d{5,}\b', '', text)
+    # Remove bracketed tags and content
+    text = re.sub(r'\[.*?\]', '', text)
+    # Remove boilerplate/disclaimer lines
+    text = re.sub(r'Client Identifying Data.*?not allowed.*?\.?', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'No CID Disclaimer accepted: TRUE', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'I have read and understood the disclaimer.*', '', text, flags=re.IGNORECASE)
+    # Remove greetings and sign-offs (start/end of lines)
+    text = re.sub(r'^(hi|hello|dear|greetings)[\s,]+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'(thanks|thank you|regards|best regards|cheers)[\s,]*$', '', text, flags=re.IGNORECASE)
+    # Remove phone numbers and user details
+    text = re.sub(r'Tel\.?[\s:\-]*\d+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'User details:.*?(?=Topic:|$)', '', text, flags=re.IGNORECASE)
+    # Remove (T12345) style tags
+    text = re.sub(r'\(T\d+\)', '', text)
+    # Remove long digit/space/hyphen combos (phone numbers)
+    text = re.sub(r'\+?\d[\d\s\-]{7,}', '', text)
+    # Remove repeated dashes/underscores
+    text = re.sub(r'[-_]{2,}', '', text)
+    # Collapse whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Truncate to maxlen
+    return text
 
 def build_prompt(rows: list[dict]) -> str:
     incidents = "\n".join(
-        f"{i+1}. [{r['number']}] {r['description']}"
-        for i, r in enumerate(rows)
+        f"{i+1}. [{r['number']}] {r['description']}" for i, r in enumerate(rows)
     )
     return f"""You are analyzing {len(rows)} IT incidents from an Investment Bank.
 Your output will be used by senior management to reduce recurring incidents.
 
 Rules:
-- Extract the application or system name from the description text
-- Group incidents only where the root cause is genuinely the same
-- Be specific: write "Users locked out after AD password reset" not "access issue"
-- Only include groups where 2 or more incidents share the same root cause
-- If the application cannot be identified from the text, use "Unknown System"
-- Return ONLY valid JSON — no markdown fences, no explanation, nothing else
+- Extract the application or system name from the description text.
+- Group incidents together if they share the same root cause OR if they represent repeated requests for the same operational process or workflow (e.g., repeated requests to create Storm IDs, repeated manual report retriggers, etc.).
+- Be specific: write "Users locked out after AD password reset" not "access issue".
+- If only one incident exists for a particular issue, include it as its own group (do not omit unique incidents).
+- **Every incident must appear in the output, either as part of a group or as its own group. Do not omit any incident for any reason.**
+- If the application cannot be identified from the text, use "Unknown System".
+- Return ONLY valid JSON — no markdown fences, no explanation, nothing else.
 
 Output format:
 {{
   "groups": [
     {{
       "application": "name of the system or application",
-      "issue": "precise description of the recurring problem",
+      "issue": "precise description of the problem or request",
       "count": <number>,
       "incident_numbers": ["INC001", "INC002"],
       "business_impact": "one sentence describing the business effect",
-      "recommended_action": "one concrete action to prevent recurrence"
+      "recommended_action": "one concrete action to prevent recurrence or address the issue"
     }}
   ]
 }}
 
+
 Incidents:
-{incidents}"""
+{incidents}
+"""
 
 
 def parse_response(raw: str) -> list[dict] | None:
@@ -147,27 +186,34 @@ def build_excel(groups: list[dict]) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — Upload CSV
+# STEP 1 — Upload Excel
 # ══════════════════════════════════════════════════════════════════════════════
-st.header("Step 1 — Upload Incident CSV")
+st.header("Step 1 — Upload Incident Excel")
 
-uploaded = st.file_uploader("Upload your monthly incidents CSV", type="csv")
-
+uploaded = st.file_uploader("Upload your monthly incidents Excel file", type="xlsx")
 if uploaded:
-    df_raw = pd.read_csv(uploaded)
+    df_raw = pd.read_excel(uploaded)
     cols = df_raw.columns.tolist()
 
     col1, col2 = st.columns(2)
-    with col1:
-        num_col = st.selectbox("Incident number column", cols,
-                               index=next((i for i, c in enumerate(cols) if "number" in c.lower() or "id" in c.lower() or "inc" in c.lower()), 0))
-    with col2:
-        desc_col = st.selectbox("Description column", cols,
-                                index=next((i for i, c in enumerate(cols) if "desc" in c.lower() or "summary" in c.lower()), min(1, len(cols)-1)))
+    num_col = col1.selectbox(
+        "Incident number column", cols,
+        index=next((i for i, c in enumerate(cols) if "number" in c.lower() or "id" in c.lower() or "inc" in c.lower()), 0)
+    )
+    desc_col = col2.selectbox(
+        "Description column",
+        cols,
+        index=(
+            next((i for i, c in enumerate(cols) if c.lower() == "description"),
+                next((i for i, c in enumerate(cols) if "description" in c.lower() or "summary" in c.lower()),
+                    min(1, len(cols)-1)))
+        )
+    )
 
     df = df_raw[[num_col, desc_col]].dropna(subset=[desc_col]).copy()
     df.columns = ["number", "description_raw"]
     df["description"] = df["description_raw"].apply(preprocess)
+
     st.session_state.df = df
 
     st.success(f"{len(df)} incidents loaded")
@@ -186,7 +232,21 @@ if st.session_state.df is not None:
 
     if st.session_state.prompt:
         st.info("Copy the entire prompt below and paste it into Claude, ChatGPT, or your AI tool of choice.")
-        st.code(st.session_state.prompt, language=None)
+        preview_lines = "\n".join(st.session_state.prompt.splitlines()[:10])
+        st.code(preview_lines + "\n...", language=None)
+        with st.expander("Show full prompt"):
+            st.code(st.session_state.prompt, language=None)
+        copy_button(st.session_state.prompt, tooltip="Copy full prompt to clipboard", copied_label="Copied!", icon="st")
+        st.markdown(
+            """
+            <a href="https://goto/red" target="_blank">
+                <button style="background-color:red;color:white;padding:0.5em 1.5em;border:none;border-radius:4px;font-size:1em;cursor:pointer;">
+                    Go to Red Portal
+                </button>
+            </a>
+            """,
+            unsafe_allow_html=True
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 3 — Paste AI Response
@@ -221,11 +281,16 @@ if st.session_state.groups:
     st.divider()
     st.header("Step 4 — Results")
 
+    col_month, col_year = st.columns([2, 1])
+    selected_month = col_month.selectbox("Report Month", months, index=now.month - 1)
+    selected_year = col_year.selectbox("Report Year", years, index=0)
+
     groups = st.session_state.groups
     total_covered = sum(g.get("count", 0) for g in groups)
     applications = sorted({g.get("application", "Unknown") for g in groups})
 
-    m1, m2, m3 = st.columns(3)
+    m0, m1, m2, m3 = st.columns(4)
+    m0.metric("Total Incidents Analysed", len(st.session_state.df))
     m1.metric("Incident Groups", len(groups))
     m2.metric("Incidents Covered", total_covered)
     m3.metric("Applications Affected", len(applications))
@@ -255,12 +320,13 @@ if st.session_state.groups:
 
     # ── Excel export ──
     st.subheader("Export")
-    month_str = datetime.now().strftime("%Y-%m")
     excel_bytes = build_excel(groups)
+    excel_filename = f"universal_request_incident_patterns_{selected_year}-{selected_month}.xlsx"
+
     st.download_button(
         label="Download Excel Report",
         data=excel_bytes,
-        file_name=f"incident_patterns_{month_str}.xlsx",
+        file_name=excel_filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
     )
