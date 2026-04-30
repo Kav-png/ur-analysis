@@ -28,7 +28,8 @@ months = [
 years = [str(y) for y in range(now.year, now.year - 5, -1)]
 
 # ── session state ──────────────────────────────────────────────────────────────
-for key in ("df", "batches", "batch_size", "all_groups", "missing_ids"):
+for key in ("df", "batches", "batch_size", "all_groups", "missing_ids",
+            "processing_mode", "cross_batch_done", "management_email_text"):
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -131,6 +132,76 @@ def parse_response(raw: str) -> list[dict] | None:
             "recommended_action": g.get("recommended_action") or g.get("act", ""),
         })
     return groups
+
+
+def build_cross_batch_prompt(groups: list[dict]) -> str:
+    groups_json = json.dumps({"groups": groups}, indent=2)
+    return f"""You are a senior IT incident analyst reviewing grouped incident data from an Investment Bank.
+The groups below were produced by analysing batches of incidents separately. Because they were processed
+in separate batches, similar issues may have been described slightly differently and placed into distinct
+groups when they should be one consolidated group.
+
+Your task:
+1. Review ALL groups below carefully.
+2. Identify groups that represent the same underlying root cause or operational issue, even if the
+   wording differs (e.g. "AD password reset locking users out" and "Users cannot log in after password
+   change" are the same issue).
+3. Consolidate such groups: merge their incident_numbers, sum their counts, and write a single precise
+   issue description. Keep the most informative business_impact and recommended_action.
+4. Groups that are genuinely distinct should remain separate.
+5. Every incident_number from the input must appear exactly once in the output. Do not omit any.
+6. Return ONLY valid JSON — no markdown fences, no explanation, nothing else.
+
+Output format (same as input):
+{{
+  "groups": [
+    {{
+      "application": "name of the system or application",
+      "issue": "precise description of the problem or request",
+      "count": <number of incident_numbers in this group>,
+      "incident_numbers": ["INC001", "INC002"],
+      "business_impact": "one sentence describing the business effect",
+      "recommended_action": "one concrete action to prevent recurrence or address the issue"
+    }}
+  ]
+}}
+
+Current merged groups ({len(groups)} groups, produced from batch processing):
+{groups_json}
+"""
+
+
+def build_management_email_prompt(groups: list[dict], top_n: int) -> str:
+    sorted_groups = sorted(groups, key=lambda g: g.get("count", 0), reverse=True)
+    top_groups = sorted_groups[:top_n]
+    numbered_list = "\n".join(
+        f"{i+1}. Application: {g['application']}\n"
+        f"   Issue: {g['issue']}\n"
+        f"   Incident Count: {g['count']}\n"
+        f"   Business Impact: {g.get('business_impact', '')}\n"
+        f"   Recommended Action: {g.get('recommended_action', '')}"
+        for i, g in enumerate(top_groups)
+    )
+    return f"""You are a senior IT communications specialist at an Investment Bank.
+Write a professional executive email to senior management summarising the top {top_n} recurring
+IT incidents from this month's analysis. The email should be clear, concise, and appropriate for
+C-suite and VP-level readers who need to understand business impact and recommended actions.
+
+Requirements:
+- Start with a brief executive summary paragraph (2–3 sentences max).
+- Include a formatted table with columns: Rank | Application | Issue | Count | Business Impact | Recommended Action
+- Close with a short paragraph on overall risk and a recommended next step.
+- Use plain text with markdown-style formatting (| for table columns, ** for bold headings).
+- Do NOT use JSON. Return the email body as plain text only.
+- Tone: professional, direct, no jargon, suitable for senior management.
+
+Top {top_n} incident groups (sorted by count, highest first):
+{numbered_list}
+"""
+
+
+def parse_cross_batch_response(raw: str) -> list[dict] | None:
+    return parse_response(raw)
 
 
 def merge_all_batches(batches: list[dict]) -> list[dict]:
@@ -274,119 +345,261 @@ if uploaded:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Configure Batches & Generate Prompts
+# STEP 2 — Choose Processing Mode & Generate Prompts
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.df is not None:
     st.divider()
-    st.header("Step 2 — Configure & Analyse Batches")
+    st.header("Step 2 — Choose Processing Mode")
+
+    mode = st.radio(
+        "How do you want to analyse the incidents?",
+        options=["batch", "all"],
+        format_func=lambda x: (
+            "Batch processing — split into smaller chunks (recommended for large datasets)"
+            if x == "batch"
+            else "Process all incidents together — single prompt (best for smaller datasets)"
+        ),
+        index=0 if st.session_state.processing_mode != "all" else 1,
+        horizontal=True,
+        key="mode_radio",
+    )
+    st.session_state.processing_mode = mode
 
     total = len(st.session_state.df)
-    batch_size = st.slider(
-        "Incidents per batch", min_value=25, max_value=150, value=75, step=25,
-        help="Smaller batches = more paste-backs but better AI coverage per batch. 50–75 is the sweet spot."
-    )
 
-    n_batches = -(-total // batch_size)  # ceiling division
-    st.caption(f"{total} incidents → **{n_batches} batch{'es' if n_batches != 1 else ''}** of up to {batch_size}")
+    # ── Option A: All together ─────────────────────────────────────────────────
+    if mode == "all":
+        st.subheader("Step 2A — Process All Incidents Together")
+        st.info(f"This generates a single prompt for all {total} incidents. Best for datasets under ~100 incidents.")
 
-    if st.button("Generate Batch Prompts", type="primary"):
         rows = st.session_state.df[["number", "description"]].to_dict("records")
-        batches = []
-        for i in range(n_batches):
-            chunk = rows[i * batch_size: (i + 1) * batch_size]
-            batches.append({
-                "index":   i,
-                "rows":    chunk,
-                "prompt":  build_prompt(chunk),
-                "groups":  None,
-                "complete": False,
-            })
-        st.session_state.batches       = batches
-        st.session_state.batch_size    = batch_size
-        st.session_state.all_groups    = None
-        st.session_state.missing_ids   = None
+        full_prompt = build_prompt(rows)
 
-    if st.session_state.batches:
-        batches = st.session_state.batches
-        completed = sum(1 for b in batches if b["complete"])
-        covered   = sum(len(n) for b in batches if b["complete"]
-                        for g in (b["groups"] or []) for n in [g["incident_numbers"]])
+        preview = "\n".join(full_prompt.splitlines()[:10])
+        st.code(preview + "\n...", language=None)
+        with st.expander("Show full prompt"):
+            st.code(full_prompt, language=None)
 
-        # Overall progress bar
-        st.progress(completed / len(batches), text=f"{completed}/{len(batches)} batches complete")
+        copy_button(full_prompt, tooltip="Copy full prompt", copied_label="Copied!", icon="st")
+        st.markdown(
+            """<a href="https://goto/red" target="_blank">
+                <button style="background-color:red;color:white;padding:0.5em 1.5em;border:none;border-radius:4px;font-size:1em;cursor:pointer;">
+                    Go to Red Portal
+                </button>
+            </a>""",
+            unsafe_allow_html=True
+        )
 
-        tab_labels = [
-            f"{'✅' if b['complete'] else '⏳'} Batch {b['index']+1} ({len(b['rows'])} incidents)"
-            for b in batches
-        ]
-        tabs = st.tabs(tab_labels)
+        raw_all = st.text_area(
+            "Paste AI response here",
+            height=200,
+            key="response_all",
+            placeholder='{"groups": [{"application": "...", "issue": "...", ...}]}'
+        )
 
-        for tab, batch in zip(tabs, batches):
-            with tab:
-                inc_range = f"{batch['index']*st.session_state.batch_size + 1}–{batch['index']*st.session_state.batch_size + len(batch['rows'])}"
-                st.caption(f"Incidents {inc_range} of {total}")
-
-                if batch["complete"]:
-                    st.success(f"Complete — {sum(g['count'] for g in batch['groups'])} incidents grouped into {len(batch['groups'])} groups")
+        if st.button("Process All Incidents", type="primary", key="process_all"):
+            if not raw_all.strip():
+                st.warning("Paste the AI response before processing.")
+            else:
+                groups = parse_response(raw_all)
+                if groups is None:
+                    st.error("Could not parse as JSON.")
+                    with st.expander("Debug — show received text"):
+                        st.text(f"First 300 chars:\n{raw_all[:300]}")
+                        st.text(f"Last 100 chars:\n{raw_all[-100:]}")
+                elif len(groups) == 0:
+                    st.warning("No groups found — try re-running the prompt.")
                 else:
-                    st.info("Copy the prompt below, paste into your AI tool, then paste the response back here.")
+                    st.session_state.batches = [{
+                        "index": 0,
+                        "rows": rows,
+                        "prompt": full_prompt,
+                        "groups": groups,
+                        "complete": True,
+                    }]
+                    st.session_state.batch_size = len(rows)
+                    st.session_state.all_groups = groups
+                    all_ids = set(st.session_state.df["number"].astype(str))
+                    covered_ids = {n for g in groups for n in g["incident_numbers"]}
+                    st.session_state.missing_ids = sorted(all_ids - covered_ids)
+                    st.session_state.cross_batch_done = False
+                    st.rerun()
 
-                preview = "\n".join(batch["prompt"].splitlines()[:10])
-                st.code(preview + "\n...", language=None)
-                with st.expander("Show full prompt"):
-                    st.code(batch["prompt"], language=None)
+        if st.session_state.all_groups and st.session_state.processing_mode == "all":
+            st.success(f"Processed — {len(st.session_state.all_groups)} groups found. Continue to Step 3 below.")
 
-                copy_button(batch["prompt"], tooltip=f"Copy Batch {batch['index']+1} prompt",
-                            copied_label="Copied!", icon="st")
-                st.markdown(
-                    """<a href="https://goto/red" target="_blank">
-                        <button style="background-color:red;color:white;padding:0.5em 1.5em;border:none;border-radius:4px;font-size:1em;cursor:pointer;">
-                            Go to Red Portal
-                        </button>
-                    </a>""",
-                    unsafe_allow_html=True
-                )
+    # ── Option B: Batch processing ─────────────────────────────────────────────
+    else:
+        st.subheader("Step 2B — Configure & Analyse Batches")
 
-                response_key = f"response_batch_{batch['index']}"
-                raw_response = st.text_area(
-                    "Paste AI response here",
-                    height=200,
-                    key=response_key,
-                    placeholder='{"groups": [{"application": "...", "issue": "...", ...}]}'
-                )
+        batch_size = st.slider(
+            "Incidents per batch", min_value=25, max_value=150, value=75, step=25,
+            help="Smaller batches = more paste-backs but better AI coverage per batch. 50–75 is the sweet spot."
+        )
 
-                if st.button(f"Process Batch {batch['index']+1}", type="primary",
-                             key=f"process_{batch['index']}"):
-                    if not raw_response.strip():
-                        st.warning("Paste the AI response before processing.")
+        n_batches = -(-total // batch_size)  # ceiling division
+        st.caption(f"{total} incidents → **{n_batches} batch{'es' if n_batches != 1 else ''}** of up to {batch_size}")
+
+        if st.button("Generate Batch Prompts", type="primary"):
+            rows = st.session_state.df[["number", "description"]].to_dict("records")
+            batches = []
+            for i in range(n_batches):
+                chunk = rows[i * batch_size: (i + 1) * batch_size]
+                batches.append({
+                    "index":   i,
+                    "rows":    chunk,
+                    "prompt":  build_prompt(chunk),
+                    "groups":  None,
+                    "complete": False,
+                })
+            st.session_state.batches       = batches
+            st.session_state.batch_size    = batch_size
+            st.session_state.all_groups    = None
+            st.session_state.missing_ids   = None
+            st.session_state.cross_batch_done = None
+
+        if st.session_state.batches:
+            batches = st.session_state.batches
+            completed = sum(1 for b in batches if b["complete"])
+
+            st.progress(completed / len(batches), text=f"{completed}/{len(batches)} batches complete")
+
+            tab_labels = [
+                f"{'✅' if b['complete'] else '⏳'} Batch {b['index']+1} ({len(b['rows'])} incidents)"
+                for b in batches
+            ]
+            tabs = st.tabs(tab_labels)
+
+            for tab, batch in zip(tabs, batches):
+                with tab:
+                    inc_range = f"{batch['index']*st.session_state.batch_size + 1}–{batch['index']*st.session_state.batch_size + len(batch['rows'])}"
+                    st.caption(f"Incidents {inc_range} of {total}")
+
+                    if batch["complete"]:
+                        st.success(f"Complete — {sum(g['count'] for g in batch['groups'])} incidents grouped into {len(batch['groups'])} groups")
                     else:
-                        groups = parse_response(raw_response)
-                        if groups is None:
-                            st.error("Could not parse as JSON.")
-                            with st.expander("Debug — show received text"):
-                                st.text(f"First 300 chars:\n{raw_response[:300]}")
-                                st.text(f"Last 100 chars:\n{raw_response[-100:]}")
-                        elif len(groups) == 0:
-                            st.warning("No groups found — try re-running the prompt.")
+                        st.info("Copy the prompt below, paste into your AI tool, then paste the response back here.")
+
+                    preview = "\n".join(batch["prompt"].splitlines()[:10])
+                    st.code(preview + "\n...", language=None)
+                    with st.expander("Show full prompt"):
+                        st.code(batch["prompt"], language=None)
+
+                    copy_button(batch["prompt"], tooltip=f"Copy Batch {batch['index']+1} prompt",
+                                copied_label="Copied!", icon="st")
+                    st.markdown(
+                        """<a href="https://goto/red" target="_blank">
+                            <button style="background-color:red;color:white;padding:0.5em 1.5em;border:none;border-radius:4px;font-size:1em;cursor:pointer;">
+                                Go to Red Portal
+                            </button>
+                        </a>""",
+                        unsafe_allow_html=True
+                    )
+
+                    response_key = f"response_batch_{batch['index']}"
+                    raw_response = st.text_area(
+                        "Paste AI response here",
+                        height=200,
+                        key=response_key,
+                        placeholder='{"groups": [{"application": "...", "issue": "...", ...}]}'
+                    )
+
+                    if st.button(f"Process Batch {batch['index']+1}", type="primary",
+                                 key=f"process_{batch['index']}"):
+                        if not raw_response.strip():
+                            st.warning("Paste the AI response before processing.")
                         else:
-                            st.session_state.batches[batch["index"]]["groups"]   = groups
-                            st.session_state.batches[batch["index"]]["complete"] = True
-                            # Recompute merged groups
-                            st.session_state.all_groups = merge_all_batches(st.session_state.batches)
-                            # Recompute coverage
-                            all_ids     = set(st.session_state.df["number"].astype(str))
-                            covered_ids = {n for g in st.session_state.all_groups
-                                           for n in g["incident_numbers"]}
-                            st.session_state.missing_ids = sorted(all_ids - covered_ids)
-                            st.rerun()
+                            groups = parse_response(raw_response)
+                            if groups is None:
+                                st.error("Could not parse as JSON.")
+                                with st.expander("Debug — show received text"):
+                                    st.text(f"First 300 chars:\n{raw_response[:300]}")
+                                    st.text(f"Last 100 chars:\n{raw_response[-100:]}")
+                            elif len(groups) == 0:
+                                st.warning("No groups found — try re-running the prompt.")
+                            else:
+                                st.session_state.batches[batch["index"]]["groups"]   = groups
+                                st.session_state.batches[batch["index"]]["complete"] = True
+                                st.session_state.all_groups = merge_all_batches(st.session_state.batches)
+                                all_ids     = set(st.session_state.df["number"].astype(str))
+                                covered_ids = {n for g in st.session_state.all_groups
+                                               for n in g["incident_numbers"]}
+                                st.session_state.missing_ids = sorted(all_ids - covered_ids)
+                                st.session_state.cross_batch_done = False
+                                st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Results & Export
+# STEP 3 — Cross-Batch Pattern Analyser
+# ══════════════════════════════════════════════════════════════════════════════
+if st.session_state.all_groups is not None:
+    st.divider()
+    st.header("Step 3 — Cross-Batch Pattern Analysis")
+
+    if st.session_state.cross_batch_done:
+        st.success(f"Cross-batch analysis complete — {len(st.session_state.all_groups)} final groups.")
+        if st.button("Re-run cross-batch analysis", type="secondary", key="rerun_crossbatch"):
+            st.session_state.cross_batch_done = False
+            st.rerun()
+    else:
+        n_batches_done = sum(1 for b in (st.session_state.batches or []) if b["complete"])
+        st.info(
+            f"You have {n_batches_done} batch(es) of results merged into "
+            f"**{len(st.session_state.all_groups)} groups**. This step asks Claude to consolidate "
+            f"any groups that represent the same issue but were described differently across batches."
+        )
+
+        cross_prompt = build_cross_batch_prompt(st.session_state.all_groups)
+
+        preview = "\n".join(cross_prompt.splitlines()[:10])
+        st.code(preview + "\n...", language=None)
+        with st.expander("Show full cross-batch prompt"):
+            st.code(cross_prompt, language=None)
+
+        copy_button(cross_prompt, tooltip="Copy cross-batch prompt", copied_label="Copied!", icon="st")
+        st.markdown(
+            """<a href="https://goto/red" target="_blank">
+                <button style="background-color:red;color:white;padding:0.5em 1.5em;border:none;border-radius:4px;font-size:1em;cursor:pointer;">
+                    Go to Red Portal
+                </button>
+            </a>""",
+            unsafe_allow_html=True
+        )
+
+        raw_cross = st.text_area(
+            "Paste cross-batch AI response here",
+            height=250,
+            key="response_cross_batch",
+            placeholder='{"groups": [{"application": "...", "issue": "...", ...}]}'
+        )
+
+        if st.button("Process Cross-Batch Response", type="primary", key="process_cross_batch"):
+            if not raw_cross.strip():
+                st.warning("Paste the AI response before processing.")
+            else:
+                refined_groups = parse_cross_batch_response(raw_cross)
+                if refined_groups is None:
+                    st.error("Could not parse as JSON.")
+                    with st.expander("Debug — show received text"):
+                        st.text(f"First 300 chars:\n{raw_cross[:300]}")
+                        st.text(f"Last 100 chars:\n{raw_cross[-100:]}")
+                elif len(refined_groups) == 0:
+                    st.warning("No groups returned — try re-running the prompt.")
+                else:
+                    st.session_state.all_groups = refined_groups
+                    all_ids = set(st.session_state.df["number"].astype(str))
+                    covered_ids = {n for g in refined_groups for n in g["incident_numbers"]}
+                    st.session_state.missing_ids = sorted(all_ids - covered_ids)
+                    st.session_state.cross_batch_done = True
+                    st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4 — Results & Export
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.all_groups:
     st.divider()
-    st.header("Step 3 — Results")
+    st.header("Step 4 — Results")
 
     groups       = st.session_state.all_groups
     missing_ids  = st.session_state.missing_ids or []
@@ -554,3 +767,66 @@ if st.session_state.all_groups:
         top10 = app_month_counts.head(10)["Total"].sort_values(ascending=True)
         st.markdown("**Top 10 Applications — Total Incidents Across All Months**")
         st.bar_chart(top10)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5 — Management Email Generator
+# ══════════════════════════════════════════════════════════════════════════════
+if st.session_state.all_groups and st.session_state.cross_batch_done:
+    st.divider()
+    st.header("Step 5 — Management Email")
+    st.caption("Generate a professional executive email summarising the top recurring incidents for senior management.")
+
+    groups = st.session_state.all_groups
+    max_groups = len(groups)
+
+    top_n = st.number_input(
+        "Number of top incident groups to include in the email",
+        min_value=1,
+        max_value=max_groups,
+        value=min(5, max_groups),
+        step=1,
+        help="Groups are sorted by incident count. The top N by count will be included in the email table.",
+        key="email_top_n",
+    )
+
+    email_prompt = build_management_email_prompt(groups, int(top_n))
+
+    preview = "\n".join(email_prompt.splitlines()[:10])
+    st.code(preview + "\n...", language=None)
+    with st.expander("Show full email prompt"):
+        st.code(email_prompt, language=None)
+
+    copy_button(email_prompt, tooltip="Copy email prompt", copied_label="Copied!", icon="st")
+    st.markdown(
+        """<a href="https://goto/red" target="_blank">
+            <button style="background-color:red;color:white;padding:0.5em 1.5em;border:none;border-radius:4px;font-size:1em;cursor:pointer;">
+                Go to Red Portal
+            </button>
+        </a>""",
+        unsafe_allow_html=True
+    )
+
+    raw_email = st.text_area(
+        "Paste the email response here",
+        height=300,
+        key="response_email",
+        placeholder="Paste the plain-text email from Claude here..."
+    )
+
+    if st.button("Process Email Response", type="primary", key="process_email"):
+        if not raw_email.strip():
+            st.warning("Paste the AI response before processing.")
+        else:
+            st.session_state.management_email_text = raw_email.strip()
+            st.rerun()
+
+    if st.session_state.management_email_text:
+        st.subheader("Generated Management Email")
+        st.markdown(st.session_state.management_email_text)
+        copy_button(
+            st.session_state.management_email_text,
+            tooltip="Copy email to clipboard",
+            copied_label="Copied!",
+            icon="st",
+        )
