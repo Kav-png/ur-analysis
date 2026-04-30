@@ -228,6 +228,20 @@ def merge_all_batches(batches: list[dict]) -> list[dict]:
     return merged
 
 
+def _autofit_columns(ws, min_width: int = 10, max_width: int = 60) -> None:
+    """Set each column width to fit its widest cell content, then wrap all data cells."""
+    for col_cells in ws.columns:
+        col_letter = get_column_letter(col_cells[0].column)
+        best = min_width
+        for cell in col_cells:
+            if cell.value is not None:
+                # Account for newlines in cell text
+                longest_line = max(len(str(line)) for line in str(cell.value).splitlines() or [""])
+                best = max(best, longest_line)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.column_dimensions[col_letter].width = min(best + 2, max_width)
+
+
 def build_excel(groups: list[dict], unaccounted_df: pd.DataFrame | None = None) -> bytes:
     wb = Workbook()
     header_font = Font(bold=True, color="FFFFFF")
@@ -251,10 +265,7 @@ def build_excel(groups: list[dict], unaccounted_df: pd.DataFrame | None = None) 
         if row_idx % 2 == 0:
             for col_idx in range(1, len(headers)+1):
                 ws1.cell(row=row_idx, column=col_idx).fill = alt_fill
-        for col_idx in range(1, len(headers)+1):
-            ws1.cell(row=row_idx, column=col_idx).alignment = Alignment(wrap_text=True)
-    for i, width in enumerate([28, 48, 10, 48, 48], 1):
-        ws1.column_dimensions[get_column_letter(i)].width = width
+    _autofit_columns(ws1)
 
     ws2 = wb.create_sheet("Incident Detail")
     detail_headers = ["Group", "Application", "Issue", "Incident Numbers"]
@@ -268,9 +279,7 @@ def build_excel(groups: list[dict], unaccounted_df: pd.DataFrame | None = None) 
     for group_idx, g in enumerate(sorted_groups, 1):
         ws2.append([group_idx, g.get("application",""), g.get("issue",""),
                     ", ".join(g.get("incident_numbers",[]))])
-        ws2.cell(row=group_idx+1, column=4).alignment = Alignment(wrap_text=True)
-    for col_idx, width in enumerate([8, 28, 48, 60], 1):
-        ws2.column_dimensions[get_column_letter(col_idx)].width = width
+    _autofit_columns(ws2)
 
     if unaccounted_df is not None and not unaccounted_df.empty:
         ws3 = wb.create_sheet("Unaccounted")
@@ -283,8 +292,7 @@ def build_excel(groups: list[dict], unaccounted_df: pd.DataFrame | None = None) 
         ws3.freeze_panes = "A2"
         for _, row in unaccounted_df.iterrows():
             ws3.append([str(row["number"]), str(row["description_raw"])])
-        ws3.column_dimensions["A"].width = 20
-        ws3.column_dimensions["B"].width = 80
+        _autofit_columns(ws3)
 
     buf = io.BytesIO()
     wb.save(buf)
