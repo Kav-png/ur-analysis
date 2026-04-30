@@ -422,7 +422,7 @@ if st.session_state.df is not None:
                     all_ids = set(st.session_state.df["number"].astype(str))
                     covered_ids = {n for g in groups for n in g["incident_numbers"]}
                     st.session_state.missing_ids = sorted(all_ids - covered_ids)
-                    st.session_state.cross_batch_done = False
+                    st.session_state.cross_batch_done = True
                     st.rerun()
 
         if st.session_state.all_groups and st.session_state.processing_mode == "all":
@@ -532,7 +532,7 @@ if st.session_state.df is not None:
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 3 — Cross-Batch Pattern Analyser
 # ══════════════════════════════════════════════════════════════════════════════
-if st.session_state.all_groups is not None:
+if st.session_state.all_groups is not None and st.session_state.processing_mode == "batch":
     st.divider()
     st.header("Step 3 — Cross-Batch Pattern Analysis")
 
@@ -599,7 +599,8 @@ if st.session_state.all_groups is not None:
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.all_groups:
     st.divider()
-    st.header("Step 4 — Results")
+    _results_step = "Step 3" if st.session_state.processing_mode == "all" else "Step 4"
+    st.header(f"{_results_step} — Results")
 
     groups       = st.session_state.all_groups
     missing_ids  = st.session_state.missing_ids or []
@@ -774,7 +775,8 @@ if st.session_state.all_groups:
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.all_groups and st.session_state.cross_batch_done:
     st.divider()
-    st.header("Step 5 — Management Email")
+    _email_step = "Step 4" if st.session_state.processing_mode == "all" else "Step 5"
+    st.header(f"{_email_step} — Management Email")
     st.caption("Generate a professional executive email summarising the top recurring incidents for senior management.")
 
     groups = st.session_state.all_groups
