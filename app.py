@@ -200,12 +200,7 @@ Top {top_n} incident groups (sorted by count, highest first):
 """
 
 
-def parse_cross_batch_response(raw: str) -> list[dict] | None:
-    return parse_response(raw)
-
-
 def merge_all_batches(batches: list[dict]) -> list[dict]:
-    """Merge groups from all completed batches, deduplicating incident numbers."""
     seen: set[str] = set()
     merged: list[dict] = []
     for batch in batches:
@@ -213,7 +208,6 @@ def merge_all_batches(batches: list[dict]) -> list[dict]:
             unique_ids = [n for n in g["incident_numbers"] if n not in seen]
             seen.update(unique_ids)
             if unique_ids:
-                # Check if a group with same application+issue already exists (cross-batch duplicate)
                 existing = next(
                     (m for m in merged
                      if m["application"].lower() == g["application"].lower()
@@ -229,13 +223,11 @@ def merge_all_batches(batches: list[dict]) -> list[dict]:
 
 
 def _autofit_columns(ws, min_width: int = 10, max_width: int = 60) -> None:
-    """Set each column width to fit its widest cell content, then wrap all data cells."""
     for col_cells in ws.columns:
         col_letter = get_column_letter(col_cells[0].column)
         best = min_width
         for cell in col_cells:
             if cell.value is not None:
-                # Account for newlines in cell text
                 longest_line = max(len(str(line)) for line in str(cell.value).splitlines() or [""])
                 best = max(best, longest_line)
             cell.alignment = Alignment(wrap_text=True, vertical="top")
@@ -320,6 +312,46 @@ def load_history() -> list[dict]:
     return records
 
 
+def red_portal_button() -> None:
+    st.markdown(
+        """<a href="https://goto/red" target="_blank">
+            <button style="background-color:red;color:white;padding:0.5em 1.5em;
+                border:none;border-radius:4px;font-size:1em;cursor:pointer;">
+                Go to Red Portal
+            </button>
+        </a>""",
+        unsafe_allow_html=True,
+    )
+
+
+def prompt_panel(prompt: str, copy_label: str, key: str, height: int = 200,
+                 placeholder: str = '{"groups": [...]}') -> str:
+    st.code("\n".join(prompt.splitlines()[:10]) + "\n...", language=None)
+    with st.expander("Show full prompt"):
+        st.code(prompt, language=None)
+    copy_button(prompt, tooltip=copy_label, copied_label="Copied!", icon="st")
+    red_portal_button()
+    return st.text_area("Paste AI response here", height=height, key=key, placeholder=placeholder)
+
+
+def show_parse_error(raw: str) -> None:
+    st.error("Could not parse as JSON.")
+    with st.expander("Debug — show received text"):
+        st.text(f"First 300 chars:\n{raw[:300]}")
+        st.text(f"Last 100 chars:\n{raw[-100:]}")
+
+
+def update_coverage(groups: list[dict]) -> None:
+    all_ids = set(st.session_state.df["number"].astype(str))
+    covered = {n for g in groups for n in g["incident_numbers"]}
+    st.session_state.missing_ids = sorted(all_ids - covered)
+
+
+def highlight_recurring(row) -> list[str]:
+    color = "background-color: #fff3cd" if row["Months Active"] >= 3 else ""
+    return [color] * len(row)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — Upload Excel
 # ══════════════════════════════════════════════════════════════════════════════
@@ -383,27 +415,7 @@ if st.session_state.df is not None:
         rows = st.session_state.df[["number", "description"]].to_dict("records")
         full_prompt = build_prompt(rows)
 
-        preview = "\n".join(full_prompt.splitlines()[:10])
-        st.code(preview + "\n...", language=None)
-        with st.expander("Show full prompt"):
-            st.code(full_prompt, language=None)
-
-        copy_button(full_prompt, tooltip="Copy full prompt", copied_label="Copied!", icon="st")
-        st.markdown(
-            """<a href="https://goto/red" target="_blank">
-                <button style="background-color:red;color:white;padding:0.5em 1.5em;border:none;border-radius:4px;font-size:1em;cursor:pointer;">
-                    Go to Red Portal
-                </button>
-            </a>""",
-            unsafe_allow_html=True
-        )
-
-        raw_all = st.text_area(
-            "Paste AI response here",
-            height=200,
-            key="response_all",
-            placeholder='{"groups": [{"application": "...", "issue": "...", ...}]}'
-        )
+        raw_all = prompt_panel(full_prompt, "Copy full prompt", "response_all")
 
         if st.button("Process All Incidents", type="primary", key="process_all"):
             if not raw_all.strip():
@@ -411,25 +423,17 @@ if st.session_state.df is not None:
             else:
                 groups = parse_response(raw_all)
                 if groups is None:
-                    st.error("Could not parse as JSON.")
-                    with st.expander("Debug — show received text"):
-                        st.text(f"First 300 chars:\n{raw_all[:300]}")
-                        st.text(f"Last 100 chars:\n{raw_all[-100:]}")
+                    show_parse_error(raw_all)
                 elif len(groups) == 0:
                     st.warning("No groups found — try re-running the prompt.")
                 else:
                     st.session_state.batches = [{
-                        "index": 0,
-                        "rows": rows,
-                        "prompt": full_prompt,
-                        "groups": groups,
-                        "complete": True,
+                        "index": 0, "rows": rows, "prompt": full_prompt,
+                        "groups": groups, "complete": True,
                     }]
                     st.session_state.batch_size = len(rows)
                     st.session_state.all_groups = groups
-                    all_ids = set(st.session_state.df["number"].astype(str))
-                    covered_ids = {n for g in groups for n in g["incident_numbers"]}
-                    st.session_state.missing_ids = sorted(all_ids - covered_ids)
+                    update_coverage(groups)
                     st.session_state.cross_batch_done = True
                     st.rerun()
 
@@ -445,22 +449,17 @@ if st.session_state.df is not None:
             help="Smaller batches = more paste-backs but better AI coverage per batch. 50–75 is the sweet spot."
         )
 
-        n_batches = -(-total // batch_size)  # ceiling division
+        n_batches = -(-total // batch_size)
         st.caption(f"{total} incidents → **{n_batches} batch{'es' if n_batches != 1 else ''}** of up to {batch_size}")
 
         if st.button("Generate Batch Prompts", type="primary"):
             rows = st.session_state.df[["number", "description"]].to_dict("records")
-            batches = []
-            for i in range(n_batches):
-                chunk = rows[i * batch_size: (i + 1) * batch_size]
-                batches.append({
-                    "index":   i,
-                    "rows":    chunk,
-                    "prompt":  build_prompt(chunk),
-                    "groups":  None,
-                    "complete": False,
-                })
-            st.session_state.batches       = batches
+            st.session_state.batches = [
+                {"index": i, "rows": chunk, "prompt": build_prompt(chunk), "groups": None, "complete": False}
+                for i, chunk in (
+                    (i, rows[i * batch_size: (i + 1) * batch_size]) for i in range(n_batches)
+                )
+            ]
             st.session_state.batch_size    = batch_size
             st.session_state.all_groups    = None
             st.session_state.missing_ids   = None
@@ -472,44 +471,26 @@ if st.session_state.df is not None:
 
             st.progress(completed / len(batches), text=f"{completed}/{len(batches)} batches complete")
 
-            tab_labels = [
+            tabs = st.tabs([
                 f"{'✅' if b['complete'] else '⏳'} Batch {b['index']+1} ({len(b['rows'])} incidents)"
                 for b in batches
-            ]
-            tabs = st.tabs(tab_labels)
+            ])
 
             for tab, batch in zip(tabs, batches):
                 with tab:
-                    inc_range = f"{batch['index']*st.session_state.batch_size + 1}–{batch['index']*st.session_state.batch_size + len(batch['rows'])}"
-                    st.caption(f"Incidents {inc_range} of {total}")
+                    start = batch['index'] * st.session_state.batch_size + 1
+                    end   = start + len(batch['rows']) - 1
+                    st.caption(f"Incidents {start}–{end} of {total}")
 
                     if batch["complete"]:
                         st.success(f"Complete — {sum(g['count'] for g in batch['groups'])} incidents grouped into {len(batch['groups'])} groups")
                     else:
                         st.info("Copy the prompt below, paste into your AI tool, then paste the response back here.")
 
-                    preview = "\n".join(batch["prompt"].splitlines()[:10])
-                    st.code(preview + "\n...", language=None)
-                    with st.expander("Show full prompt"):
-                        st.code(batch["prompt"], language=None)
-
-                    copy_button(batch["prompt"], tooltip=f"Copy Batch {batch['index']+1} prompt",
-                                copied_label="Copied!", icon="st")
-                    st.markdown(
-                        """<a href="https://goto/red" target="_blank">
-                            <button style="background-color:red;color:white;padding:0.5em 1.5em;border:none;border-radius:4px;font-size:1em;cursor:pointer;">
-                                Go to Red Portal
-                            </button>
-                        </a>""",
-                        unsafe_allow_html=True
-                    )
-
-                    response_key = f"response_batch_{batch['index']}"
-                    raw_response = st.text_area(
-                        "Paste AI response here",
-                        height=200,
-                        key=response_key,
-                        placeholder='{"groups": [{"application": "...", "issue": "...", ...}]}'
+                    raw_response = prompt_panel(
+                        batch["prompt"],
+                        f"Copy Batch {batch['index']+1} prompt",
+                        f"response_batch_{batch['index']}",
                     )
 
                     if st.button(f"Process Batch {batch['index']+1}", type="primary",
@@ -519,20 +500,14 @@ if st.session_state.df is not None:
                         else:
                             groups = parse_response(raw_response)
                             if groups is None:
-                                st.error("Could not parse as JSON.")
-                                with st.expander("Debug — show received text"):
-                                    st.text(f"First 300 chars:\n{raw_response[:300]}")
-                                    st.text(f"Last 100 chars:\n{raw_response[-100:]}")
+                                show_parse_error(raw_response)
                             elif len(groups) == 0:
                                 st.warning("No groups found — try re-running the prompt.")
                             else:
                                 st.session_state.batches[batch["index"]]["groups"]   = groups
                                 st.session_state.batches[batch["index"]]["complete"] = True
                                 st.session_state.all_groups = merge_all_batches(st.session_state.batches)
-                                all_ids     = set(st.session_state.df["number"].astype(str))
-                                covered_ids = {n for g in st.session_state.all_groups
-                                               for n in g["incident_numbers"]}
-                                st.session_state.missing_ids = sorted(all_ids - covered_ids)
+                                update_coverage(st.session_state.all_groups)
                                 st.session_state.cross_batch_done = False
                                 st.rerun()
 
@@ -557,58 +532,36 @@ if st.session_state.all_groups is not None and st.session_state.processing_mode 
             f"any groups that represent the same issue but were described differently across batches."
         )
 
-        cross_prompt = build_cross_batch_prompt(st.session_state.all_groups)
-
-        preview = "\n".join(cross_prompt.splitlines()[:10])
-        st.code(preview + "\n...", language=None)
-        with st.expander("Show full cross-batch prompt"):
-            st.code(cross_prompt, language=None)
-
-        copy_button(cross_prompt, tooltip="Copy cross-batch prompt", copied_label="Copied!", icon="st")
-        st.markdown(
-            """<a href="https://goto/red" target="_blank">
-                <button style="background-color:red;color:white;padding:0.5em 1.5em;border:none;border-radius:4px;font-size:1em;cursor:pointer;">
-                    Go to Red Portal
-                </button>
-            </a>""",
-            unsafe_allow_html=True
-        )
-
-        raw_cross = st.text_area(
-            "Paste cross-batch AI response here",
+        raw_cross = prompt_panel(
+            build_cross_batch_prompt(st.session_state.all_groups),
+            "Copy cross-batch prompt",
+            "response_cross_batch",
             height=250,
-            key="response_cross_batch",
-            placeholder='{"groups": [{"application": "...", "issue": "...", ...}]}'
         )
 
         if st.button("Process Cross-Batch Response", type="primary", key="process_cross_batch"):
             if not raw_cross.strip():
                 st.warning("Paste the AI response before processing.")
             else:
-                refined_groups = parse_cross_batch_response(raw_cross)
+                refined_groups = parse_response(raw_cross)
                 if refined_groups is None:
-                    st.error("Could not parse as JSON.")
-                    with st.expander("Debug — show received text"):
-                        st.text(f"First 300 chars:\n{raw_cross[:300]}")
-                        st.text(f"Last 100 chars:\n{raw_cross[-100:]}")
+                    show_parse_error(raw_cross)
                 elif len(refined_groups) == 0:
                     st.warning("No groups returned — try re-running the prompt.")
                 else:
                     st.session_state.all_groups = refined_groups
-                    all_ids = set(st.session_state.df["number"].astype(str))
-                    covered_ids = {n for g in refined_groups for n in g["incident_numbers"]}
-                    st.session_state.missing_ids = sorted(all_ids - covered_ids)
+                    update_coverage(refined_groups)
                     st.session_state.cross_batch_done = True
                     st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — Results & Export
+# STEP 4 / 3 — Results & Export
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.all_groups:
     st.divider()
-    _results_step = "Step 3" if st.session_state.processing_mode == "all" else "Step 4"
-    st.header(f"{_results_step} — Results")
+    _s = 0 if st.session_state.processing_mode == "all" else 1
+    st.header(f"Step {3 + _s} — Results")
 
     groups       = st.session_state.all_groups
     missing_ids  = st.session_state.missing_ids or []
@@ -687,25 +640,18 @@ if st.session_state.all_groups:
     if len(history) < 2:
         st.info("Save data for 2 or more months to see trend analysis.")
     else:
-        rows_hist = []
         month_idx = {m: i for i, m in enumerate(months)}
         sorted_history = sorted(history, key=lambda r: (int(r["year"]), month_idx.get(r["month"], 0)))
 
-        for record in sorted_history:
-            label = f"{record['month']} {record['year']}"
-            for g in record.get("groups", []):
-                rows_hist.append({
-                    "month_label": label,
-                    "year":        record["year"],
-                    "month":       record["month"],
-                    "application": g.get("application", "Unknown"),
-                    "count":       g.get("count", 0),
-                })
+        rows_hist = [
+            {"month_label": f"{r['month']} {r['year']}", "year": r["year"],
+             "month": r["month"], "application": g.get("application", "Unknown"), "count": g.get("count", 0)}
+            for r in sorted_history for g in r.get("groups", [])
+        ]
 
         hist_df    = pd.DataFrame(rows_hist)
         month_order = [f"{r['month']} {r['year']}" for r in sorted_history]
 
-        # Applications by month pivot
         app_month_counts = (
             hist_df.groupby(["application", "month_label"])["count"]
             .sum().unstack(fill_value=0)
@@ -716,32 +662,24 @@ if st.session_state.all_groups:
         app_month_counts = app_month_counts.sort_values("Total", ascending=False)
 
         st.markdown("**Applications by Month (incident count)**")
-
-        def highlight_recurring(row):
-            color = "background-color: #fff3cd" if row["Months Active"] >= 3 else ""
-            return [color] * len(row)
-
         st.dataframe(app_month_counts.style.apply(highlight_recurring, axis=1), use_container_width=True)
         st.caption("Amber rows = application appeared in 3 or more months")
 
-        # Monthly volume chart
         st.markdown("**Monthly Incident Volume**")
         target_pct = st.slider(
             "Target reduction per month (%)", min_value=1, max_value=30, value=10, step=1
         )
 
-        monthly_rows = []
-        for record in sorted_history:
-            label = f"{record['month'][:3]} {record['year']}"
-            total = sum(g.get("count", 0) for g in record.get("groups", []))
-            monthly_rows.append({"month": label, "total": total})
-
-        df_vol = pd.DataFrame(monthly_rows)
-        df_vol["order"]       = range(len(df_vol))
-        df_vol["moving_avg"]  = df_vol["total"].rolling(window=3, min_periods=1).mean().round(1)
-        baseline              = df_vol["total"].iloc[0]
-        df_vol["target"]      = [round(baseline * ((1 - target_pct / 100) ** i), 1) for i in range(len(df_vol))]
-        df_vol["status"]      = df_vol.apply(
+        df_vol = pd.DataFrame([
+            {"month": f"{r['month'][:3]} {r['year']}",
+             "total": sum(g.get("count", 0) for g in r.get("groups", []))}
+            for r in sorted_history
+        ])
+        df_vol["order"]      = range(len(df_vol))
+        df_vol["moving_avg"] = df_vol["total"].rolling(window=3, min_periods=1).mean().round(1)
+        baseline             = df_vol["total"].iloc[0]
+        df_vol["target"]     = [round(baseline * ((1 - target_pct / 100) ** i), 1) for i in range(len(df_vol))]
+        df_vol["status"]     = df_vol.apply(
             lambda r: "Above average" if r["total"] > r["moving_avg"] else "At or below average", axis=1
         )
 
@@ -761,12 +699,8 @@ if st.session_state.all_groups:
                 alt.Tooltip("target:Q",     title=f"Target (-{target_pct}%/mo)"),
             ]
         )
-        ma_line = base.mark_line(color="#F4A900", strokeWidth=2.5, point=True).encode(
-            y="moving_avg:Q"
-        )
-        target_line = base.mark_line(color="#C00000", strokeWidth=2, strokeDash=[6, 3]).encode(
-            y="target:Q"
-        )
+        ma_line = base.mark_line(color="#F4A900", strokeWidth=2.5, point=True).encode(y="moving_avg:Q")
+        target_line = base.mark_line(color="#C00000", strokeWidth=2, strokeDash=[6, 3]).encode(y="target:Q")
         st.altair_chart(
             (bars + ma_line + target_line).properties(height=350).configure_axis(labelFontSize=12, titleFontSize=13),
             use_container_width=True
@@ -779,49 +713,29 @@ if st.session_state.all_groups:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — Management Email Generator
+# STEP 5 / 4 — Management Email Generator
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.all_groups and st.session_state.cross_batch_done:
     st.divider()
-    _email_step = "Step 4" if st.session_state.processing_mode == "all" else "Step 5"
-    st.header(f"{_email_step} — Management Email")
+    _s = 0 if st.session_state.processing_mode == "all" else 1
+    st.header(f"Step {4 + _s} — Management Email")
     st.caption("Generate a professional executive email summarising the top recurring incidents for senior management.")
 
     groups = st.session_state.all_groups
-    max_groups = len(groups)
 
     top_n = st.number_input(
         "Number of top incident groups to include in the email",
-        min_value=1,
-        max_value=max_groups,
-        value=min(5, max_groups),
-        step=1,
+        min_value=1, max_value=len(groups), value=min(5, len(groups)), step=1,
         help="Groups are sorted by incident count. The top N by count will be included in the email table.",
         key="email_top_n",
     )
 
-    email_prompt = build_management_email_prompt(groups, int(top_n))
-
-    preview = "\n".join(email_prompt.splitlines()[:10])
-    st.code(preview + "\n...", language=None)
-    with st.expander("Show full email prompt"):
-        st.code(email_prompt, language=None)
-
-    copy_button(email_prompt, tooltip="Copy email prompt", copied_label="Copied!", icon="st")
-    st.markdown(
-        """<a href="https://goto/red" target="_blank">
-            <button style="background-color:red;color:white;padding:0.5em 1.5em;border:none;border-radius:4px;font-size:1em;cursor:pointer;">
-                Go to Red Portal
-            </button>
-        </a>""",
-        unsafe_allow_html=True
-    )
-
-    raw_email = st.text_area(
-        "Paste the email response here",
+    raw_email = prompt_panel(
+        build_management_email_prompt(groups, int(top_n)),
+        "Copy email prompt",
+        "response_email",
         height=300,
-        key="response_email",
-        placeholder="Paste the plain-text email from Claude here..."
+        placeholder="Paste the plain-text email from Claude here...",
     )
 
     if st.button("Process Email Response", type="primary", key="process_email"):
