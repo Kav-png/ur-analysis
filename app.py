@@ -1,6 +1,7 @@
 import re
 import json
 import io
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -29,9 +30,12 @@ years = [str(y) for y in range(now.year, now.year - 5, -1)]
 
 # ── session state ──────────────────────────────────────────────────────────────
 for key in ("df", "batches", "batch_size", "all_groups", "missing_ids",
-            "processing_mode", "cross_batch_done"):
+            "processing_mode", "cross_batch_done",
+            "loaded_from_file", "loaded_year", "loaded_month"):
     if key not in st.session_state:
         st.session_state[key] = None
+if "merge_selected" not in st.session_state:
+    st.session_state.merge_selected = set()
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -108,6 +112,13 @@ Incidents:
 """
 
 
+def ensure_group_ids(groups: list[dict]) -> list[dict]:
+    for g in groups:
+        if "_id" not in g:
+            g["_id"] = str(uuid.uuid4())
+    return groups
+
+
 def normalise_quotes(text: str) -> str:
     return (text
         .replace('“', '"').replace('”', '"')
@@ -142,6 +153,7 @@ def parse_response(raw: str) -> list[dict] | None:
         if not unique_ids:
             continue
         groups.append({
+            "_id":                str(uuid.uuid4()),
             "application":        g.get("application") or g.get("app", "Unknown System"),
             "issue":              g.get("issue") or g.get("iss", ""),
             "incident_numbers":   unique_ids,
@@ -207,6 +219,7 @@ def apply_cross_batch_merge(original_groups: list[dict], merge_spec: list[dict])
             incident_numbers.extend(original_groups[idx].get("incident_numbers", []))
             assigned[idx] = True
         result.append({
+            "_id":                str(uuid.uuid4()),
             "application":        spec.get("application", "Unknown System"),
             "issue":              spec.get("issue", ""),
             "incident_numbers":   incident_numbers,
@@ -238,7 +251,8 @@ def merge_all_batches(batches: list[dict]) -> list[dict]:
                     existing["incident_numbers"].extend(unique_ids)
                     existing["count"] = len(existing["incident_numbers"])
                 else:
-                    merged.append({**g, "incident_numbers": unique_ids, "count": len(unique_ids)})
+                    merged.append({**g, "_id": str(uuid.uuid4()),
+                                   "incident_numbers": unique_ids, "count": len(unique_ids)})
     return merged
 
 
@@ -332,6 +346,42 @@ def load_history() -> list[dict]:
     return records
 
 
+def load_results_record(record: dict) -> None:
+    year   = record.get("year", "")
+    month  = record.get("month", "")
+    groups = record.get("groups", [])
+
+    csv_path = DATA_DIR / f"raw_data_{year}_{month}.csv"
+    df = None
+    if csv_path.exists():
+        try:
+            df = pd.read_csv(csv_path)
+            df.columns = [c.lower() for c in df.columns]
+            if "number" not in df.columns or "description_raw" not in df.columns:
+                df = None
+        except Exception:
+            df = None
+
+    if df is None:
+        all_ids = [n for g in groups for n in g.get("incident_numbers", [])]
+        df = pd.DataFrame({"number": all_ids, "description_raw": ["(not available)"] * len(all_ids)})
+
+    all_ids_set = set(df["number"].astype(str))
+    covered     = {n for g in groups for n in g.get("incident_numbers", [])}
+    ensure_group_ids(groups)
+
+    st.session_state.df               = df
+    st.session_state.all_groups       = groups
+    st.session_state.missing_ids      = sorted(all_ids_set - covered)
+    st.session_state.loaded_from_file = True
+    st.session_state.loaded_year      = year
+    st.session_state.loaded_month     = month
+    st.session_state.batches          = None
+    st.session_state.batch_size       = None
+    st.session_state.processing_mode  = None
+    st.session_state.cross_batch_done = None
+
+
 def red_portal_button() -> None:
     st.markdown(
         """<a href="https://goto/red" target="_blank">
@@ -367,53 +417,153 @@ def update_coverage(groups: list[dict]) -> None:
     st.session_state.missing_ids = sorted(all_ids - covered)
 
 
+def _find_group(gid: str) -> dict | None:
+    return next((g for g in (st.session_state.all_groups or []) if g["_id"] == gid), None)
+
+
+def _sync_field(gid: str, field: str, widget_key: str) -> None:
+    g = _find_group(gid)
+    if g is not None:
+        g[field] = st.session_state[widget_key]
+
+
+def _delete_group(gid: str) -> None:
+    g = _find_group(gid)
+    if g is None:
+        return
+    freed = g.get("incident_numbers", [])
+    st.session_state.all_groups = [x for x in st.session_state.all_groups if x["_id"] != gid]
+    st.session_state.missing_ids = sorted(
+        set(st.session_state.missing_ids or []) | set(freed)
+    )
+    st.session_state.merge_selected.discard(gid)
+
+
+def _add_to_group(gid: str, ids_to_add: list[str]) -> None:
+    g = _find_group(gid)
+    if g is None or not ids_to_add:
+        return
+    g["incident_numbers"] = list(dict.fromkeys(g["incident_numbers"] + ids_to_add))
+    g["count"] = len(g["incident_numbers"])
+    st.session_state.missing_ids = sorted(
+        set(st.session_state.missing_ids or []) - set(ids_to_add)
+    )
+
+
+def _merge_groups(gids: list[str], new_issue: str) -> None:
+    sources = [g for g in st.session_state.all_groups if g["_id"] in gids]
+    if len(sources) < 2:
+        return
+    merged_ids: list[str] = []
+    seen: set[str] = set()
+    for g in sources:
+        for n in g["incident_numbers"]:
+            if n not in seen:
+                seen.add(n)
+                merged_ids.append(n)
+    new_group = {
+        "_id":                str(uuid.uuid4()),
+        "application":        sources[0]["application"],
+        "issue":              new_issue or sources[0]["issue"],
+        "incident_numbers":   merged_ids,
+        "count":              len(merged_ids),
+        "business_impact":    sources[0]["business_impact"],
+        "recommended_action": sources[0]["recommended_action"],
+    }
+    keep = [g for g in st.session_state.all_groups if g["_id"] not in gids]
+    st.session_state.all_groups = keep + [new_group]
+    st.session_state.merge_selected = set()
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR — Browse & Load Saved Reports
+# ══════════════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.header("Saved Reports")
+
+    _history = load_history()
+    if _history:
+        _labels = [f"{r['month']} {r['year']}" for r in _history]
+        _choice = st.selectbox("Select a saved report", ["— choose —"] + _labels,
+                               key="sidebar_select")
+        if st.button("Load Selected", key="sidebar_load_btn",
+                     disabled=(_choice == "— choose —")):
+            load_results_record(_history[_labels.index(_choice)])
+            st.rerun()
+    else:
+        st.info("No saved reports found in `data/`.")
+
+    st.divider()
+    st.subheader("Upload a JSON Report")
+    _uploaded_json = st.file_uploader("Upload processed_data JSON", type="json",
+                                      key="sidebar_json_upload")
+    if _uploaded_json is not None:
+        try:
+            _record = json.loads(_uploaded_json.read())
+            if st.button("Load Uploaded JSON", key="sidebar_json_load_btn"):
+                load_results_record(_record)
+                st.rerun()
+        except (json.JSONDecodeError, OSError):
+            st.error("Invalid JSON file — could not parse.")
+
+    if st.session_state.loaded_from_file:
+        st.divider()
+        if st.button("Clear loaded report", key="sidebar_clear_btn", type="secondary"):
+            for _k in ("df", "batches", "batch_size", "all_groups", "missing_ids",
+                       "processing_mode", "cross_batch_done",
+                       "loaded_from_file", "loaded_year", "loaded_month"):
+                st.session_state[_k] = None
+            st.rerun()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — Upload Excel
 # ══════════════════════════════════════════════════════════════════════════════
-st.header("Step 1 — Upload Incident Excel")
+if not st.session_state.loaded_from_file:
+    st.header("Step 1 — Upload Incident Excel")
 
-uploaded = st.file_uploader("Upload your monthly incidents Excel file", type="xlsx")
-if uploaded:
-    df_raw = pd.read_excel(uploaded)
-    cols = df_raw.columns.tolist()
+    uploaded = st.file_uploader("Upload your monthly incidents Excel file", type="xlsx")
+    if uploaded:
+        df_raw = pd.read_excel(uploaded)
+        cols = df_raw.columns.tolist()
 
-    col1, col2 = st.columns(2)
-    num_col = col1.selectbox(
-        "Incident number column", cols,
-        index=next((i for i, c in enumerate(cols)
-                    if "number" in c.lower() or "id" in c.lower() or "inc" in c.lower()), 0)
-    )
-    desc_col = col2.selectbox(
-        "Description column", cols,
-        index=(next((i for i, c in enumerate(cols) if c.lower() == "description"),
-               next((i for i, c in enumerate(cols)
-                     if "description" in c.lower() or "summary" in c.lower()), min(1, len(cols)-1))))
-    )
+        col1, col2 = st.columns(2)
+        num_col = col1.selectbox(
+            "Incident number column", cols,
+            index=next((i for i, c in enumerate(cols)
+                        if "number" in c.lower() or "id" in c.lower() or "inc" in c.lower()), 0)
+        )
+        desc_col = col2.selectbox(
+            "Description column", cols,
+            index=(next((i for i, c in enumerate(cols) if c.lower() == "description"),
+                   next((i for i, c in enumerate(cols)
+                         if "description" in c.lower() or "summary" in c.lower()), min(1, len(cols)-1))))
+        )
 
-    maxlen = st.slider(
-        "Max description length after preprocessing (characters)",
-        min_value=100, max_value=2000, value=500, step=50,
-        help="Increase if important context is being cut off. The preview below updates live.",
-    )
+        maxlen = st.slider(
+            "Max description length after preprocessing (characters)",
+            min_value=100, max_value=2000, value=500, step=50,
+            help="Increase if important context is being cut off. The preview below updates live.",
+        )
 
-    df = df_raw[[num_col, desc_col]].dropna(subset=[desc_col]).copy()
-    df.columns = ["number", "description_raw"]
-    df["description"] = df["description_raw"].apply(lambda x: preprocess(x, maxlen=maxlen))
-    st.session_state.df = df
+        df = df_raw[[num_col, desc_col]].dropna(subset=[desc_col]).copy()
+        df.columns = ["number", "description_raw"]
+        df["description"] = df["description_raw"].apply(lambda x: preprocess(x, maxlen=maxlen))
+        st.session_state.df = df
 
-    st.success(f"{len(df)} incidents loaded")
+        st.success(f"{len(df)} incidents loaded")
 
-    with st.expander("Preview — Before & After Preprocessing (first 5 rows)", expanded=True):
-        preview = df[["number", "description_raw", "description"]].head(5).copy()
-        preview.columns = ["Incident Number", "Description (Before)", "Description (After)"]
-        st.dataframe(preview, use_container_width=True, hide_index=True)
+        with st.expander("Preview — Before & After Preprocessing (first 5 rows)", expanded=True):
+            preview = df[["number", "description_raw", "description"]].head(5).copy()
+            preview.columns = ["Incident Number", "Description (Before)", "Description (After)"]
+            st.dataframe(preview, use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 2 — Choose Processing Mode & Generate Prompts
 # ══════════════════════════════════════════════════════════════════════════════
-if st.session_state.df is not None:
+if st.session_state.df is not None and not st.session_state.loaded_from_file:
     st.divider()
     st.header("Step 2 — Choose Processing Mode")
 
@@ -626,18 +776,22 @@ if st.session_state.all_groups:
     batches_total= len(st.session_state.batches or [])
 
     col_month, col_year = st.columns([2, 1])
-    selected_month = col_month.selectbox("Report Month", months, index=now.month - 1)
-    selected_year  = col_year.selectbox("Report Year", years, index=0)
+    _mi = months.index(st.session_state.loaded_month) if st.session_state.loaded_month in months else now.month - 1
+    _yi = years.index(st.session_state.loaded_year)   if st.session_state.loaded_year  in years  else 0
+    selected_month = col_month.selectbox("Report Month", months, index=_mi)
+    selected_year  = col_year.selectbox("Report Year",   years,  index=_yi)
 
     total_covered = sum(g.get("count", 0) for g in groups)
     applications  = sorted({g.get("application", "Unknown") for g in groups})
 
     m0, m1, m2, m3, m4 = st.columns(5)
-    m0.metric("Total Incidents",    len(st.session_state.df))
-    m1.metric("Batches Complete",   f"{batches_done}/{batches_total}")
-    m2.metric("Incidents Covered",  total_covered)
-    m3.metric("Groups Found",       len(groups))
-    m4.metric("Applications",       len(applications))
+    m0.metric("Total Incidents",   len(st.session_state.df))
+    m1.metric("Batches Complete",
+              "Loaded from file" if st.session_state.loaded_from_file
+              else f"{batches_done}/{batches_total}")
+    m2.metric("Incidents Covered", total_covered)
+    m3.metric("Groups Found",      len(groups))
+    m4.metric("Applications",      len(applications))
 
     if missing_ids:
         st.warning(f"⚠ {len(missing_ids)} incidents not yet covered — complete remaining batches or check AI responses.")
@@ -645,11 +799,68 @@ if st.session_state.all_groups:
             missing_df = st.session_state.df[st.session_state.df["number"].astype(str).isin(missing_ids)]
             st.dataframe(missing_df[["number", "description_raw"]], use_container_width=True, hide_index=True)
     else:
-        st.success(f"All {len(st.session_state.df)} incidents covered across {batches_done} batches.")
+        st.success(
+            f"All {len(st.session_state.df)} incidents covered."
+            if st.session_state.loaded_from_file
+            else f"All {len(st.session_state.df)} incidents covered across {batches_done} batches."
+        )
+
+    # ── Donut chart — incidents by application ────────────────────────────────
+    app_totals = {}
+    for g in groups:
+        app = g.get("application", "Unknown")
+        app_totals[app] = app_totals.get(app, 0) + g.get("count", 0)
+    donut_df = pd.DataFrame(
+        [{"application": a, "count": c} for a, c in sorted(app_totals.items(), key=lambda x: -x[1])]
+    )
+    donut = (
+        alt.Chart(donut_df)
+        .mark_arc(innerRadius=80, outerRadius=160)
+        .encode(
+            theta=alt.Theta("count:Q"),
+            color=alt.Color(
+                "application:N",
+                legend=alt.Legend(title="Application", orient="right"),
+            ),
+            tooltip=[
+                alt.Tooltip("application:N", title="Application"),
+                alt.Tooltip("count:Q",       title="Incidents"),
+            ],
+        )
+        .properties(
+            title=f"{selected_month} {selected_year} — Incidents by Application",
+            height=380,
+        )
+    )
+    st.altair_chart(donut, use_container_width=True)
 
     st.subheader("Groups by Application")
+
+    ensure_group_ids(groups)
     sorted_groups = sorted(groups, key=lambda g: g.get("count", 0), reverse=True)
 
+    # ── Merge bar (appears when 2+ groups are checked) ───────────────────────
+    sel = st.session_state.merge_selected
+    if len(sel) >= 2:
+        with st.container(border=True):
+            mc1, mc2 = st.columns([3, 1])
+            mc1.markdown(f"**{len(sel)} groups selected for merge**")
+            merge_issue = mc1.text_input(
+                "Merged issue description",
+                placeholder="Write a description for the merged group…",
+                key="merge_issue_input",
+                label_visibility="collapsed",
+            )
+            if mc2.button("Merge", type="primary", key="do_merge_btn"):
+                _merge_groups(list(sel), merge_issue)
+                groups = st.session_state.all_groups
+                update_coverage(groups)
+                st.rerun()
+            if mc2.button("Clear selection", key="clear_merge_btn"):
+                st.session_state.merge_selected = set()
+                st.rerun()
+
+    # ── Group expanders ───────────────────────────────────────────────────────
     for app in sorted({g.get("application", "Unknown") for g in sorted_groups},
                       key=lambda a: sum(g["count"] for g in sorted_groups if g.get("application") == a),
                       reverse=True):
@@ -657,21 +868,91 @@ if st.session_state.all_groups:
         app_total  = sum(g.get("count", 0) for g in app_groups)
         with st.expander(f"{app}  —  {app_total} incident{'s' if app_total != 1 else ''}"):
             for g in app_groups:
-                st.markdown(f"**Issue:** {g.get('issue', '')}")
-                cols = st.columns([1, 3, 3])
-                cols[0].metric("Count", g.get("count", 0))
-                cols[1].markdown(f"**Business Impact**\n\n{g.get('business_impact', '')}")
-                cols[2].markdown(f"**Recommended Action**\n\n{g.get('recommended_action', '')}")
+                gid = g["_id"]
+
+                # Merge checkbox
+                checked = st.checkbox(
+                    "Select for merge", value=(gid in sel),
+                    key=f"chk_{gid}",
+                )
+                if checked:
+                    st.session_state.merge_selected.add(gid)
+                else:
+                    st.session_state.merge_selected.discard(gid)
+
+                # Editable issue
+                issue_key = f"issue_{gid}"
+                if issue_key not in st.session_state:
+                    st.session_state[issue_key] = g.get("issue", "")
+                st.text_area(
+                    "Issue",
+                    key=issue_key,
+                    on_change=_sync_field,
+                    args=(gid, "issue", issue_key),
+                    height=80,
+                )
+
+                col_count, col_imp, col_act = st.columns([1, 3, 3])
+                col_count.metric("Count", g.get("count", 0))
+
+                # Editable business impact
+                imp_key = f"imp_{gid}"
+                if imp_key not in st.session_state:
+                    st.session_state[imp_key] = g.get("business_impact", "")
+                col_imp.text_area(
+                    "Business Impact",
+                    key=imp_key,
+                    on_change=_sync_field,
+                    args=(gid, "business_impact", imp_key),
+                    height=100,
+                )
+
+                # Editable recommended action
+                act_key = f"act_{gid}"
+                if act_key not in st.session_state:
+                    st.session_state[act_key] = g.get("recommended_action", "")
+                col_act.text_area(
+                    "Recommended Action",
+                    key=act_key,
+                    on_change=_sync_field,
+                    args=(gid, "recommended_action", act_key),
+                    height=100,
+                )
+
+                # Incident numbers
                 inc_nums = g.get("incident_numbers", [])
                 if inc_nums:
                     st.caption("Incidents: " + " · ".join(inc_nums))
+
+                # Add unaccounted incidents
+                current_missing = st.session_state.missing_ids or []
+                if current_missing:
+                    add_sel = st.multiselect(
+                        "Add unaccounted incidents to this group",
+                        options=current_missing,
+                        key=f"add_{gid}",
+                        placeholder="Select incidents to add…",
+                    )
+                    if add_sel and st.button("Add to group", key=f"addbtn_{gid}"):
+                        _add_to_group(gid, add_sel)
+                        st.session_state.pop(f"add_{gid}", None)
+                        update_coverage(st.session_state.all_groups)
+                        st.rerun()
+
+                # Delete group
+                if st.button("Delete group", key=f"del_{gid}", type="secondary"):
+                    _delete_group(gid)
+                    update_coverage(st.session_state.all_groups)
+                    st.rerun()
+
                 st.divider()
 
     # ── Save ──
-    st.subheader("Save Monthly Data")
-    if st.button(f"Save {selected_month} {selected_year} Data", type="secondary"):
-        raw_path, proc_path = save_monthly_data(st.session_state.df, groups, selected_year, selected_month)
-        st.success(f"Saved:\n- `{raw_path}`\n- `{proc_path}`")
+    if not st.session_state.loaded_from_file:
+        st.subheader("Save Monthly Data")
+        if st.button(f"Save {selected_month} {selected_year} Data", type="secondary"):
+            raw_path, proc_path = save_monthly_data(st.session_state.df, groups, selected_year, selected_month)
+            st.success(f"Saved:\n- `{raw_path}`\n- `{proc_path}`")
 
     # ── Excel Export ──
     st.subheader("Export")
