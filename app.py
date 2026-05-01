@@ -68,6 +68,18 @@ def build_prompt(rows: list[dict]) -> str:
     return f"""You are analyzing {len(rows)} IT incidents from an Investment Bank.
 Your output will be used by senior management to reduce recurring incidents.
 
+## Step 1 — Scratchpad (plain text, not JSON)
+Before producing any JSON, reason through the incidents:
+- List the distinct root-cause themes or recurring request types you can see.
+- Note any incidents that are ambiguous or hard to classify.
+- Decide which incidents belong together and why.
+This thinking is for your benefit only; it will be discarded.
+
+## Step 2 — Verify coverage
+Count the incidents you intend to include in your JSON. It must equal exactly {len(rows)}.
+If any are missing, add them before continuing.
+
+## Step 3 — Output JSON
 Rules:
 - Extract the application or system name from the description text.
 - Group incidents together if they share the same root cause OR if they represent repeated requests for the same operational process or workflow (e.g., repeated requests to create Storm IDs, repeated manual report retriggers, etc.).
@@ -75,7 +87,7 @@ Rules:
 - If only one incident exists for a particular issue, include it as its own group (do not omit unique incidents).
 - Every incident must appear in the output, either as part of a group or as its own group. Do not omit any incident for any reason.
 - If the application cannot be identified from the text, use "Unknown System".
-- Return ONLY valid JSON — no markdown fences, no explanation, nothing else.
+- After the scratchpad, return the JSON block below and nothing else.
 
 Output format:
 {{
@@ -149,18 +161,19 @@ def build_cross_batch_prompt(groups: list[dict]) -> str:
 The groups below were produced by analysing batches of incidents separately. Similar issues may have
 been described slightly differently and placed into distinct groups when they should be one.
 
-Your task:
-1. Review all {len(groups)} groups below (identified by number).
-2. Identify groups that represent the same underlying root cause or operational issue.
-3. For each set of groups that should be merged, output one consolidated entry with:
-   - The best application name
-   - A single precise issue description
-   - The best business_impact and recommended_action from the merged set
-   - source_indices: the 1-based group numbers you are merging
-4. Groups that are genuinely distinct should appear on their own (source_indices containing just their own number).
-5. Every group number from 1 to {len(groups)} must appear in exactly one source_indices list.
-6. Do NOT reproduce incident numbers — Python will handle the merge.
-7. Return ONLY valid JSON — no markdown fences, no explanation, nothing else.
+## Step 1 — Scratchpad (plain text, not JSON)
+Before producing any JSON, reason through the groups:
+- Identify clusters of groups that likely share the same root cause, even if worded differently.
+- Note any borderline cases and decide — when in doubt, prefer merging over splitting.
+- Confirm every group number from 1 to {len(groups)} is accounted for.
+
+## Step 2 — Output JSON
+Rules:
+- For each set of groups to merge, produce one entry with source_indices listing their 1-based numbers.
+- Groups that are genuinely distinct appear on their own with a single-element source_indices.
+- Every group number from 1 to {len(groups)} must appear in exactly one source_indices list.
+- Do NOT reproduce incident numbers — Python will handle the merge.
+- After the scratchpad, return the JSON block below and nothing else.
 
 Output format:
 {{
