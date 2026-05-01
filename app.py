@@ -29,28 +29,34 @@ years = [str(y) for y in range(now.year, now.year - 5, -1)]
 
 # ── session state ──────────────────────────────────────────────────────────────
 for key in ("df", "batches", "batch_size", "all_groups", "missing_ids",
-            "processing_mode", "cross_batch_done", "management_email_text"):
+            "processing_mode", "cross_batch_done"):
     if key not in st.session_state:
         st.session_state[key] = None
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
-def preprocess(text: str, maxlen: int = 200) -> str:
+def preprocess(text: str, maxlen: int = 500) -> str:
     text = str(text)
+    # remove ticket/reference IDs (e.g. INC12345, CHG99999)
     text = re.sub(r'\b[A-Z]{2,4}\d{5,}\b', '', text)
+    # remove email addresses
     text = re.sub(r'\S+@\S+', '', text)
-    text = re.sub(r'\b\d{5,}\b', '', text)
-    text = re.sub(r'\[.*?\]', '', text)
+    # remove phone numbers (must look like a phone: starts with + or has spaces/dashes between digits)
+    text = re.sub(r'Tel\.?[\s:\-]*\d+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\+\d[\d\s\-]{7,}', '', text)
+    # remove boilerplate / disclaimer lines
     text = re.sub(r'Client Identifying Data.*?not allowed.*?\.?', '', text, flags=re.IGNORECASE)
     text = re.sub(r'No CID Disclaimer accepted: TRUE', '', text, flags=re.IGNORECASE)
     text = re.sub(r'I have read and understood the disclaimer.*', '', text, flags=re.IGNORECASE)
+    # remove generic salutations and sign-offs
     text = re.sub(r'^(hi|hello|dear|greetings)[\s,]+', '', text, flags=re.IGNORECASE)
     text = re.sub(r'(thanks|thank you|regards|best regards|cheers)[\s,]*$', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'Tel\.?[\s:\-]*\d+', '', text, flags=re.IGNORECASE)
+    # remove user detail blocks
     text = re.sub(r'User details:.*?(?=Topic:|$)', '', text, flags=re.IGNORECASE)
+    # remove internal tracker tokens like (T12345)
     text = re.sub(r'\(T\d+\)', '', text)
-    text = re.sub(r'\+?\d[\d\s\-]{7,}', '', text)
-    text = re.sub(r'[-_]{2,}', '', text)
+    # collapse separators and whitespace
+    text = re.sub(r'[-_]{2,}', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text[:maxlen]
 
@@ -135,69 +141,70 @@ def parse_response(raw: str) -> list[dict] | None:
 
 
 def build_cross_batch_prompt(groups: list[dict]) -> str:
-    groups_json = json.dumps({"groups": groups}, indent=2)
+    numbered = "\n".join(
+        f"{i+1}. [{g.get('application','?')}] {g.get('issue','')}  (count: {g.get('count',0)})"
+        for i, g in enumerate(groups)
+    )
     return f"""You are a senior IT incident analyst reviewing grouped incident data from an Investment Bank.
-The groups below were produced by analysing batches of incidents separately. Because they were processed
-in separate batches, similar issues may have been described slightly differently and placed into distinct
-groups when they should be one consolidated group.
+The groups below were produced by analysing batches of incidents separately. Similar issues may have
+been described slightly differently and placed into distinct groups when they should be one.
 
 Your task:
-1. Review ALL groups below carefully.
-2. Identify groups that represent the same underlying root cause or operational issue, even if the
-   wording differs (e.g. "AD password reset locking users out" and "Users cannot log in after password
-   change" are the same issue).
-3. Consolidate such groups: merge their incident_numbers, sum their counts, and write a single precise
-   issue description. Keep the most informative business_impact and recommended_action.
-4. Groups that are genuinely distinct should remain separate.
-5. Every incident_number from the input must appear exactly once in the output. Do not omit any.
-6. Return ONLY valid JSON — no markdown fences, no explanation, nothing else.
+1. Review all {len(groups)} groups below (identified by number).
+2. Identify groups that represent the same underlying root cause or operational issue.
+3. For each set of groups that should be merged, output one consolidated entry with:
+   - The best application name
+   - A single precise issue description
+   - The best business_impact and recommended_action from the merged set
+   - source_indices: the 1-based group numbers you are merging
+4. Groups that are genuinely distinct should appear on their own (source_indices containing just their own number).
+5. Every group number from 1 to {len(groups)} must appear in exactly one source_indices list.
+6. Do NOT reproduce incident numbers — Python will handle the merge.
+7. Return ONLY valid JSON — no markdown fences, no explanation, nothing else.
 
-Output format (same as input):
+Output format:
 {{
   "groups": [
     {{
       "application": "name of the system or application",
       "issue": "precise description of the problem or request",
-      "count": <number of incident_numbers in this group>,
-      "incident_numbers": ["INC001", "INC002"],
       "business_impact": "one sentence describing the business effect",
-      "recommended_action": "one concrete action to prevent recurrence or address the issue"
+      "recommended_action": "one concrete action to prevent recurrence or address the issue",
+      "source_indices": [1, 4, 7]
     }}
   ]
 }}
 
-Current merged groups ({len(groups)} groups, produced from batch processing):
-{groups_json}
+Groups to consolidate:
+{numbered}
 """
 
 
-def build_management_email_prompt(groups: list[dict], top_n: int) -> str:
-    sorted_groups = sorted(groups, key=lambda g: g.get("count", 0), reverse=True)
-    top_groups = sorted_groups[:top_n]
-    numbered_list = "\n".join(
-        f"{i+1}. Application: {g['application']}\n"
-        f"   Issue: {g['issue']}\n"
-        f"   Incident Count: {g['count']}\n"
-        f"   Business Impact: {g.get('business_impact', '')}\n"
-        f"   Recommended Action: {g.get('recommended_action', '')}"
-        for i, g in enumerate(top_groups)
-    )
-    return f"""You are a senior IT communications specialist at an Investment Bank.
-Write a professional executive email to senior management summarising the top {top_n} recurring
-IT incidents from this month's analysis. The email should be clear, concise, and appropriate for
-C-suite and VP-level readers who need to understand business impact and recommended actions.
+def apply_cross_batch_merge(original_groups: list[dict], merge_spec: list[dict]) -> list[dict] | None:
+    n = len(original_groups)
+    assigned = [False] * n
+    result = []
+    for spec in merge_spec:
+        indices = spec.get("source_indices") or []
+        zero_based = [i - 1 for i in indices if isinstance(i, int) and 1 <= i <= n]
+        if not zero_based:
+            return None
+        incident_numbers: list[str] = []
+        for idx in zero_based:
+            incident_numbers.extend(original_groups[idx].get("incident_numbers", []))
+            assigned[idx] = True
+        result.append({
+            "application":        spec.get("application", "Unknown System"),
+            "issue":              spec.get("issue", ""),
+            "incident_numbers":   incident_numbers,
+            "count":              len(incident_numbers),
+            "business_impact":    spec.get("business_impact", ""),
+            "recommended_action": spec.get("recommended_action", ""),
+        })
+    if not all(assigned):
+        return None
+    return result
 
-Requirements:
-- Start with a brief executive summary paragraph (2–3 sentences max).
-- Include a formatted table with columns: Rank | Application | Issue | Count | Business Impact | Recommended Action
-- Close with a short paragraph on overall risk and a recommended next step.
-- Use plain text with markdown-style formatting (| for table columns, ** for bold headings).
-- Do NOT use JSON. Return the email body as plain text only.
-- Tone: professional, direct, no jargon, suitable for senior management.
-
-Top {top_n} incident groups (sorted by count, highest first):
-{numbered_list}
-"""
 
 
 def merge_all_batches(batches: list[dict]) -> list[dict]:
@@ -347,10 +354,6 @@ def update_coverage(groups: list[dict]) -> None:
     st.session_state.missing_ids = sorted(all_ids - covered)
 
 
-def highlight_recurring(row) -> list[str]:
-    color = "background-color: #fff3cd" if row["Months Active"] >= 3 else ""
-    return [color] * len(row)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — Upload Excel
@@ -375,13 +378,23 @@ if uploaded:
                      if "description" in c.lower() or "summary" in c.lower()), min(1, len(cols)-1))))
     )
 
+    maxlen = st.slider(
+        "Max description length after preprocessing (characters)",
+        min_value=100, max_value=2000, value=500, step=50,
+        help="Increase if important context is being cut off. The preview below updates live.",
+    )
+
     df = df_raw[[num_col, desc_col]].dropna(subset=[desc_col]).copy()
     df.columns = ["number", "description_raw"]
-    df["description"] = df["description_raw"].apply(preprocess)
+    df["description"] = df["description_raw"].apply(lambda x: preprocess(x, maxlen=maxlen))
     st.session_state.df = df
 
     st.success(f"{len(df)} incidents loaded")
-    st.dataframe(df[["number", "description_raw"]].head(5), use_container_width=True, hide_index=True)
+
+    with st.expander("Preview — Before & After Preprocessing (first 5 rows)", expanded=True):
+        preview = df[["number", "description_raw", "description"]].head(5).copy()
+        preview.columns = ["Incident Number", "Description (Before)", "Description (After)"]
+        st.dataframe(preview, use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -405,6 +418,13 @@ if st.session_state.df is not None:
     )
     st.session_state.processing_mode = mode
 
+    use_preprocess = st.toggle(
+        "Apply preprocessing to descriptions before generating prompts",
+        value=True,
+        help="When on, ticket IDs, emails, phone numbers, and boilerplate are stripped before sending to the AI. Turn off to send raw descriptions.",
+    )
+    desc_col = "description" if use_preprocess else "description_raw"
+
     total = len(st.session_state.df)
 
     # ── Option A: All together ─────────────────────────────────────────────────
@@ -412,7 +432,7 @@ if st.session_state.df is not None:
         st.subheader("Step 2A — Process All Incidents Together")
         st.info(f"This generates a single prompt for all {total} incidents. Best for datasets under ~100 incidents.")
 
-        rows = st.session_state.df[["number", "description"]].to_dict("records")
+        rows = st.session_state.df[["number", desc_col]].rename(columns={desc_col: "description"}).to_dict("records")
         full_prompt = build_prompt(rows)
 
         raw_all = prompt_panel(full_prompt, "Copy full prompt", "response_all")
@@ -453,7 +473,7 @@ if st.session_state.df is not None:
         st.caption(f"{total} incidents → **{n_batches} batch{'es' if n_batches != 1 else ''}** of up to {batch_size}")
 
         if st.button("Generate Batch Prompts", type="primary"):
-            rows = st.session_state.df[["number", "description"]].to_dict("records")
+            rows = st.session_state.df[["number", desc_col]].rename(columns={desc_col: "description"}).to_dict("records")
             st.session_state.batches = [
                 {"index": i, "rows": chunk, "prompt": build_prompt(chunk), "groups": None, "complete": False}
                 for i, chunk in (
@@ -466,93 +486,118 @@ if st.session_state.df is not None:
             st.session_state.cross_batch_done = None
 
         if st.session_state.batches:
-            batches = st.session_state.batches
+            batches  = st.session_state.batches
             completed = sum(1 for b in batches if b["complete"])
+            all_done  = completed == len(batches)
 
             st.progress(completed / len(batches), text=f"{completed}/{len(batches)} batches complete")
 
-            tabs = st.tabs([
-                f"{'✅' if b['complete'] else '⏳'} Batch {b['index']+1} ({len(b['rows'])} incidents)"
-                for b in batches
-            ])
+            # ── Completed summaries (collapsed) ───────────────────────────────
+            done_batches = [b for b in batches if b["complete"]]
+            if done_batches:
+                with st.expander(f"Completed batches ({len(done_batches)})", expanded=False):
+                    for b in done_batches:
+                        start = b['index'] * st.session_state.batch_size + 1
+                        end   = start + len(b['rows']) - 1
+                        n_groups = len(b['groups'])
+                        n_inc    = sum(g['count'] for g in b['groups'])
+                        st.success(
+                            f"Batch {b['index']+1} (incidents {start}–{end}) — "
+                            f"{n_inc} incidents → {n_groups} groups",
+                            icon="✅",
+                        )
+                        if st.button(f"Re-do batch {b['index']+1}", key=f"redo_{b['index']}",
+                                     type="secondary"):
+                            st.session_state.batches[b['index']]["complete"] = False
+                            st.session_state.batches[b['index']]["groups"]   = None
+                            st.session_state.cross_batch_done = None
+                            st.rerun()
 
-            for tab, batch in zip(tabs, batches):
-                with tab:
-                    start = batch['index'] * st.session_state.batch_size + 1
-                    end   = start + len(batch['rows']) - 1
-                    st.caption(f"Incidents {start}–{end} of {total}")
+            # ── Active batch: first incomplete one ────────────────────────────
+            active = next((b for b in batches if not b["complete"]), None)
+            if active is not None:
+                start = active['index'] * st.session_state.batch_size + 1
+                end   = start + len(active['rows']) - 1
+                st.subheader(f"Batch {active['index']+1} of {len(batches)}  —  incidents {start}–{end}")
+                st.info("Copy the prompt, run it in your AI tool, then paste the response below.")
 
-                    if batch["complete"]:
-                        st.success(f"Complete — {sum(g['count'] for g in batch['groups'])} incidents grouped into {len(batch['groups'])} groups")
+                raw_response = prompt_panel(
+                    active["prompt"],
+                    f"Copy Batch {active['index']+1} prompt",
+                    f"response_batch_{active['index']}",
+                )
+
+                if st.button(f"Process Batch {active['index']+1}", type="primary",
+                             key=f"process_{active['index']}"):
+                    if not raw_response.strip():
+                        st.warning("Paste the AI response before processing.")
                     else:
-                        st.info("Copy the prompt below, paste into your AI tool, then paste the response back here.")
+                        groups = parse_response(raw_response)
+                        if groups is None:
+                            show_parse_error(raw_response)
+                        elif len(groups) == 0:
+                            st.warning("No groups found — try re-running the prompt.")
+                        else:
+                            st.session_state.batches[active["index"]]["groups"]   = groups
+                            st.session_state.batches[active["index"]]["complete"] = True
+                            st.session_state.all_groups = merge_all_batches(st.session_state.batches)
+                            update_coverage(st.session_state.all_groups)
+                            st.session_state.cross_batch_done = False
+                            st.rerun()
 
-                    raw_response = prompt_panel(
-                        batch["prompt"],
-                        f"Copy Batch {batch['index']+1} prompt",
-                        f"response_batch_{batch['index']}",
+            # ── Cross-batch consolidation (inline, only when all batches done) ─
+            elif all_done and len(batches) > 1:
+                st.divider()
+                if st.session_state.cross_batch_done:
+                    st.success(f"Cross-batch consolidation complete — {len(st.session_state.all_groups)} final groups.")
+                    if st.button("Re-run consolidation", type="secondary", key="rerun_crossbatch"):
+                        st.session_state.cross_batch_done = False
+                        st.rerun()
+                else:
+                    st.subheader("Final step — Consolidate across batches")
+                    st.info(
+                        f"All {len(batches)} batches done ({len(st.session_state.all_groups)} groups so far). "
+                        "Copy the prompt below so the AI can merge any duplicates across batches."
                     )
-
-                    if st.button(f"Process Batch {batch['index']+1}", type="primary",
-                                 key=f"process_{batch['index']}"):
-                        if not raw_response.strip():
+                    raw_cross = prompt_panel(
+                        build_cross_batch_prompt(st.session_state.all_groups),
+                        "Copy consolidation prompt",
+                        "response_cross_batch",
+                        height=250,
+                    )
+                    if st.button("Process Consolidation Response", type="primary", key="process_cross_batch"):
+                        if not raw_cross.strip():
                             st.warning("Paste the AI response before processing.")
                         else:
-                            groups = parse_response(raw_response)
-                            if groups is None:
-                                show_parse_error(raw_response)
-                            elif len(groups) == 0:
-                                st.warning("No groups found — try re-running the prompt.")
+                            cleaned = re.sub(r"```json|```", "", raw_cross).strip()
+                            cleaned = normalise_quotes(cleaned)
+                            match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+                            merge_spec = None
+                            if match:
+                                try:
+                                    merge_spec = json.loads(match.group(0)).get("groups", [])
+                                except json.JSONDecodeError:
+                                    pass
+                            if merge_spec is None:
+                                show_parse_error(raw_cross)
                             else:
-                                st.session_state.batches[batch["index"]]["groups"]   = groups
-                                st.session_state.batches[batch["index"]]["complete"] = True
-                                st.session_state.all_groups = merge_all_batches(st.session_state.batches)
-                                update_coverage(st.session_state.all_groups)
-                                st.session_state.cross_batch_done = False
-                                st.rerun()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Cross-Batch Pattern Analyser
-# ══════════════════════════════════════════════════════════════════════════════
-if st.session_state.all_groups is not None and st.session_state.processing_mode == "batch":
-    st.divider()
-    st.header("Step 3 — Cross-Batch Pattern Analysis")
-
-    if st.session_state.cross_batch_done:
-        st.success(f"Cross-batch analysis complete — {len(st.session_state.all_groups)} final groups.")
-        if st.button("Re-run cross-batch analysis", type="secondary", key="rerun_crossbatch"):
-            st.session_state.cross_batch_done = False
-            st.rerun()
-    else:
-        n_batches_done = sum(1 for b in (st.session_state.batches or []) if b["complete"])
-        st.info(
-            f"You have {n_batches_done} batch(es) of results merged into "
-            f"**{len(st.session_state.all_groups)} groups**. This step asks Claude to consolidate "
-            f"any groups that represent the same issue but were described differently across batches."
-        )
-
-        raw_cross = prompt_panel(
-            build_cross_batch_prompt(st.session_state.all_groups),
-            "Copy cross-batch prompt",
-            "response_cross_batch",
-            height=250,
-        )
-
-        if st.button("Process Cross-Batch Response", type="primary", key="process_cross_batch"):
-            if not raw_cross.strip():
-                st.warning("Paste the AI response before processing.")
-            else:
-                refined_groups = parse_response(raw_cross)
-                if refined_groups is None:
-                    show_parse_error(raw_cross)
-                elif len(refined_groups) == 0:
-                    st.warning("No groups returned — try re-running the prompt.")
-                else:
-                    st.session_state.all_groups = refined_groups
-                    update_coverage(refined_groups)
-                    st.session_state.cross_batch_done = True
-                    st.rerun()
+                                refined_groups = apply_cross_batch_merge(
+                                    st.session_state.all_groups, merge_spec
+                                )
+                                if refined_groups is None:
+                                    st.error(
+                                        "Consolidation failed — the AI's source_indices didn't cover "
+                                        "all groups or referenced invalid numbers. Try re-running the prompt."
+                                    )
+                                    with st.expander("Debug — show received text"):
+                                        st.text(raw_cross[:500])
+                                elif len(refined_groups) == 0:
+                                    st.warning("No groups returned — try re-running the prompt.")
+                                else:
+                                    st.session_state.all_groups = refined_groups
+                                    update_coverage(refined_groups)
+                                    st.session_state.cross_batch_done = True
+                                    st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -560,8 +605,7 @@ if st.session_state.all_groups is not None and st.session_state.processing_mode 
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.all_groups:
     st.divider()
-    _s = 0 if st.session_state.processing_mode == "all" else 1
-    st.header(f"Step {3 + _s} — Results")
+    st.header("Step 3 — Results")
 
     groups       = st.session_state.all_groups
     missing_ids  = st.session_state.missing_ids or []
@@ -643,114 +687,48 @@ if st.session_state.all_groups:
         month_idx = {m: i for i, m in enumerate(months)}
         sorted_history = sorted(history, key=lambda r: (int(r["year"]), month_idx.get(r["month"], 0)))
 
-        rows_hist = [
-            {"month_label": f"{r['month']} {r['year']}", "year": r["year"],
-             "month": r["month"], "application": g.get("application", "Unknown"), "count": g.get("count", 0)}
+        month_order = [f"{r['month'][:3]} {r['year']}" for r in sorted_history]
+
+        hist_df = pd.DataFrame([
+            {"month": f"{r['month'][:3]} {r['year']}",
+             "application": g.get("application", "Unknown"),
+             "count": g.get("count", 0)}
             for r in sorted_history for g in r.get("groups", [])
-        ]
-
-        hist_df    = pd.DataFrame(rows_hist)
-        month_order = [f"{r['month']} {r['year']}" for r in sorted_history]
-
-        app_month_counts = (
-            hist_df.groupby(["application", "month_label"])["count"]
-            .sum().unstack(fill_value=0)
-            .reindex(columns=[m for m in month_order if m in hist_df["month_label"].values])
-        )
-        app_month_counts["Total"]         = app_month_counts.sum(axis=1)
-        app_month_counts["Months Active"] = (app_month_counts.drop(columns="Total") > 0).sum(axis=1)
-        app_month_counts = app_month_counts.sort_values("Total", ascending=False)
-
-        st.markdown("**Applications by Month (incident count)**")
-        st.dataframe(app_month_counts.style.apply(highlight_recurring, axis=1), use_container_width=True)
-        st.caption("Amber rows = application appeared in 3 or more months")
-
-        st.markdown("**Monthly Incident Volume**")
-        target_pct = st.slider(
-            "Target reduction per month (%)", min_value=1, max_value=30, value=10, step=1
-        )
+        ])
 
         df_vol = pd.DataFrame([
             {"month": f"{r['month'][:3]} {r['year']}",
              "total": sum(g.get("count", 0) for g in r.get("groups", []))}
             for r in sorted_history
         ])
-        df_vol["order"]      = range(len(df_vol))
         df_vol["moving_avg"] = df_vol["total"].rolling(window=3, min_periods=1).mean().round(1)
         baseline             = df_vol["total"].iloc[0]
-        df_vol["target"]     = [round(baseline * ((1 - target_pct / 100) ** i), 1) for i in range(len(df_vol))]
-        df_vol["status"]     = df_vol.apply(
-            lambda r: "Above average" if r["total"] > r["moving_avg"] else "At or below average", axis=1
-        )
 
-        base = alt.Chart(df_vol).encode(
-            x=alt.X("month:N", sort=None, title="Month", axis=alt.Axis(labelAngle=-30))
+        target_pct = st.slider(
+            "Target reduction per month (%)", min_value=1, max_value=30, value=10, step=1
         )
-        bars = base.mark_bar(opacity=0.85).encode(
-            y=alt.Y("total:Q", title="Total Incidents"),
-            color=alt.Color("status:N", scale=alt.Scale(
-                domain=["Above average", "At or below average"],
-                range=["#E07B39", "#1F3864"]
-            ), legend=alt.Legend(title="vs Moving Average")),
+        df_vol["target"] = [round(baseline * ((1 - target_pct / 100) ** i), 1) for i in range(len(df_vol))]
+
+        bars = alt.Chart(hist_df).mark_bar(opacity=0.9).encode(
+            x=alt.X("month:N", sort=month_order, title="Month", axis=alt.Axis(labelAngle=-30)),
+            y=alt.Y("sum(count):Q", title="Total Incidents"),
+            color=alt.Color("application:N", legend=alt.Legend(title="Application")),
             tooltip=[
-                alt.Tooltip("month:N",      title="Month"),
-                alt.Tooltip("total:Q",      title="Total Incidents"),
-                alt.Tooltip("moving_avg:Q", title="3-Month Avg"),
-                alt.Tooltip("target:Q",     title=f"Target (-{target_pct}%/mo)"),
-            ]
+                alt.Tooltip("month:N",          title="Month"),
+                alt.Tooltip("application:N",     title="Application"),
+                alt.Tooltip("count:Q",           title="Incidents"),
+            ],
         )
-        ma_line = base.mark_line(color="#F4A900", strokeWidth=2.5, point=True).encode(y="moving_avg:Q")
-        target_line = base.mark_line(color="#C00000", strokeWidth=2, strokeDash=[6, 3]).encode(y="target:Q")
+        base_vol = alt.Chart(df_vol).encode(
+            x=alt.X("month:N", sort=month_order)
+        )
+        ma_line     = base_vol.mark_line(color="#F4A900", strokeWidth=2.5, point=True).encode(y="moving_avg:Q")
+        target_line = base_vol.mark_line(color="#C00000", strokeWidth=2, strokeDash=[6, 3]).encode(y="target:Q")
+
         st.altair_chart(
-            (bars + ma_line + target_line).properties(height=350).configure_axis(labelFontSize=12, titleFontSize=13),
+            (bars + ma_line + target_line).properties(height=380).configure_axis(labelFontSize=12, titleFontSize=13),
             use_container_width=True
         )
         st.caption("Orange line = 3-month moving average  |  Red dashed = target reduction trajectory")
 
-        top10 = app_month_counts.head(10)["Total"].sort_values(ascending=True)
-        st.markdown("**Top 10 Applications — Total Incidents Across All Months**")
-        st.bar_chart(top10)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 / 4 — Management Email Generator
-# ══════════════════════════════════════════════════════════════════════════════
-if st.session_state.all_groups and st.session_state.cross_batch_done:
-    st.divider()
-    _s = 0 if st.session_state.processing_mode == "all" else 1
-    st.header(f"Step {4 + _s} — Management Email")
-    st.caption("Generate a professional executive email summarising the top recurring incidents for senior management.")
-
-    groups = st.session_state.all_groups
-
-    top_n = st.number_input(
-        "Number of top incident groups to include in the email",
-        min_value=1, max_value=len(groups), value=min(5, len(groups)), step=1,
-        help="Groups are sorted by incident count. The top N by count will be included in the email table.",
-        key="email_top_n",
-    )
-
-    raw_email = prompt_panel(
-        build_management_email_prompt(groups, int(top_n)),
-        "Copy email prompt",
-        "response_email",
-        height=300,
-        placeholder="Paste the plain-text email from Claude here...",
-    )
-
-    if st.button("Process Email Response", type="primary", key="process_email"):
-        if not raw_email.strip():
-            st.warning("Paste the AI response before processing.")
-        else:
-            st.session_state.management_email_text = raw_email.strip()
-            st.rerun()
-
-    if st.session_state.management_email_text:
-        st.subheader("Generated Management Email")
-        st.markdown(st.session_state.management_email_text)
-        copy_button(
-            st.session_state.management_email_text,
-            tooltip="Copy email to clipboard",
-            copied_label="Copied!",
-            icon="st",
-        )
